@@ -1,10 +1,20 @@
 #!/bin/bash
 set -e
 
-REMOTE_HOST=74.121.148.204
-REMOTE_USER=root
+# 从 .env 文件读取配置
+if [ ! -f .env ]; then
+  echo "错误: 缺少 .env 文件，请复制 .env.example 并填写配置"
+  exit 1
+fi
+
+set -a; source .env; set +a
+
+: "${REMOTE_HOST:?缺少 REMOTE_HOST}"
+: "${REMOTE_USER:?缺少 REMOTE_USER}"
+: "${SSH_KEY:=~/.ssh/id_ed25519}"
+: "${OPENCLAW_API_KEY:?缺少 OPENCLAW_API_KEY}"
+
 REMOTE_DIR=/usr/docker/gaogao-api
-SSH_KEY=~/.ssh/id_ed25519
 SRC_DIR=$REMOTE_DIR/src
 
 echo "=== 1. 传输源码到服务器 ==="
@@ -21,7 +31,7 @@ scp -i $SSH_KEY src/types/report.ts \
   $REMOTE_USER@$REMOTE_HOST:$SRC_DIR/src/types/
 
 echo "=== 2. 远程构建并部署 ==="
-ssh -i $SSH_KEY $REMOTE_USER@$REMOTE_HOST << 'REMOTE_SCRIPT'
+ssh -i $SSH_KEY $REMOTE_USER@$REMOTE_HOST << REMOTE_SCRIPT
 set -e
 
 SRC_DIR=/usr/docker/gaogao-api/src
@@ -50,11 +60,12 @@ docker run -d \
   -p 1555:1555 \
   -e PORT=1555 \
   -e OPENCLAW_BASE_URL=http://openclaw:18789/v1 \
-  -e OPENCLAW_API_KEY=0994bb22cf581322f8400fc135a50418ab4c8097a40bb6e1 \
+  -e OPENCLAW_API_KEY=${OPENCLAW_API_KEY} \
   -e OPENCLAW_MODEL=openclaw/report-agent \
   -e OPENCLAW_REMOTE_HOST= \
   -e REPORT_OUTPUT_DIR=/home/node/.openclaw/workspace/report-agent/reports \
-  -v /usr/docker/gaogao-api/reports:/home/node/.openclaw/workspace/report-agent/reports \
+  -e OPENCLAW_REMOTE_REPORT_DIR=/home/node/.openclaw/workspace/report-agent/reports \
+  -v /usr/docker/openclaw/workspace/report-agent/reports:/home/node/.openclaw/workspace/report-agent/reports \
   gaogao-api:latest
 
 echo "=== 3. 等待启动 ==="
