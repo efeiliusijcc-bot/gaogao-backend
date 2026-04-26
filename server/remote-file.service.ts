@@ -140,6 +140,12 @@ export class RemoteFileService {
     return filePath.startsWith('/') ? filePath : `${this.remoteDir}/${filePath}`;
   }
 
+  remapToReportDir(filePath: string): string | null {
+    const filename = path.basename(filePath);
+    if (!filename.toLowerCase().endsWith('.md')) return null;
+    return this.joinPath(this.remoteDir, filename);
+  }
+
   isInsideReportDir(filePath: string): boolean {
     if (!isRemote()) {
       const root = path.resolve(this.remoteDir).toLowerCase();

@@ -79,9 +79,21 @@ export class ReportsService {
     const reportDir = this.remoteFs.remoteDir;
     const jobScopedPath = this.remoteFs.joinPath(reportDir, `${job.jobId}.md`);
     const hasJobScopedFile = await this.remoteFs.exists(jobScopedPath);
-    const direct = await this.readMarkdownFile(hasJobScopedFile ? jobScopedPath : (job.resultPath ?? null));
-    if (hasJobScopedFile && !direct) {
-      return { html: '', artifacts: job.artifacts, resultPath: jobScopedPath };
+
+    let resultFilePath = job.resultPath ?? null;
+    if (resultFilePath && !this.remoteFs.isInsideReportDir(resultFilePath)) {
+      const remapped = this.remoteFs.remapToReportDir(resultFilePath);
+      if (remapped && await this.remoteFs.exists(remapped)) {
+        resultFilePath = remapped;
+        job.resultPath = remapped;
+      } else {
+        resultFilePath = null;
+      }
+    }
+
+    const direct = await this.readMarkdownFile(hasJobScopedFile ? jobScopedPath : resultFilePath);
+    if (hasJobScopedFile && direct) {
+      return { html: await this.renderMarkdownToHtml(direct.markdown), artifacts: job.artifacts, resultPath: direct.filePath };
     }
 
     const fallback = direct ?? (await this.findBestMarkdownFileForJob(job));
@@ -328,9 +340,10 @@ export class ReportsService {
   private isValidReportMarkdown(markdown: string, size: number): boolean {
     const text = markdown.trim();
     if (!text) return false;
-    if (size < 500) return false;
+    if (size < 2000) return false;
     if (/agent couldn't generate a response/i.test(text)) return false;
     if (/please try again/i.test(text) && text.length < 1000) return false;
+    if (/报告已生成并保存/.test(text) && size < 5000) return false;
     return true;
   }
 
