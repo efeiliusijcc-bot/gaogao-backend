@@ -1,7 +1,8 @@
-export type SkillName = 'risk-assessment-reports' | 'person-intelligence-report';
+export type SkillName = 'risk-assessment-reports' | 'person-intelligence-report' | 'write-hb';
 
 export type RiskScenario = 'leader_outbound' | 'foreign_leader_visit' | 'domestic_holiday';
 export type PersonReportType = 'new_leader' | 'visiting_dignitary';
+export type WriteHbReportType = 'K报' | 'HB报';
 export type OutputDepth = 'brief' | 'standard' | 'detailed';
 export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'waiting_approval';
 
@@ -31,7 +32,16 @@ export interface PersonReportPayload {
   language?: string;
 }
 
-export type ReportPayload = RiskAssessmentPayload | PersonReportPayload;
+export interface WriteHbPayload {
+  topic: string;
+  report_type: WriteHbReportType;
+  outline?: string;
+  focus_areas?: string[];
+  known_context?: string;
+  language?: string;
+}
+
+export type ReportPayload = RiskAssessmentPayload | PersonReportPayload | WriteHbPayload;
 
 export interface CreateJobRequest {
   skill: SkillName;

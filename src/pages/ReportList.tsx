@@ -3,9 +3,10 @@ import { Link } from 'react-router-dom';
 import { useJobList } from '../hooks/useApi';
 import type { JobStatus, SkillName } from '../types/report';
 
-const SKILL_LABELS: Record<SkillName, string> = {
+const SKILL_LABELS: Partial<Record<SkillName, string>> = {
   'risk-assessment-reports': '风险评估报告',
   'person-intelligence-report': '人物报告',
+  'write-hb': 'K报/HB报',
 };
 
 const STATUS_LABELS: Record<JobStatus, string> = {
@@ -55,7 +56,7 @@ export function ReportList() {
             {jobs.map((job) => (
               <tr key={job.jobId}>
                 <td className="mono">{job.jobId.slice(0, 8)}</td>
-                <td>{SKILL_LABELS[job.skill]}</td>
+                <td>{SKILL_LABELS[job.skill] ?? job.skill}</td>
                 <td>
                   <span className={`status status-${job.status}`}>
                     {STATUS_LABELS[job.status]}

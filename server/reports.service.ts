@@ -125,7 +125,7 @@ export class ReportsService {
     const startedAtMs = Date.now();
 
     try {
-      const requestUser = this.buildRequestUser();
+      const requestUser = this.buildRequestUser(job);
       const result = await this.openClaw.runReport({
         skill: job.skill,
         payload: job.payload as unknown as Record<string, unknown>,
@@ -347,7 +347,7 @@ export class ReportsService {
     return true;
   }
 
-  private buildRequestUser(): string {
+  private buildRequestUser(job: JobRecord): string {
     const now = new Date();
     const y = now.getFullYear();
     const m = String(now.getMonth() + 1).padStart(2, '0');
@@ -355,7 +355,7 @@ export class ReportsService {
     const key = `${y}${m}${d}`;
     const next = (this.dailySequence.get(key) ?? 0) + 1;
     this.dailySequence.set(key, next);
-    return `report-task-${key}-${String(next).padStart(3, '0')}`;
+    return `report-task-${key}-${String(next).padStart(3, '0')}-${job.jobId.slice(0, 8)}`;
   }
 
   private async renderMarkdownToHtml(markdown: string): Promise<string> {

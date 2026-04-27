@@ -145,7 +145,11 @@ export class OpenClawService {
       messages: [
         {
           role: 'system',
-          content: 'You are report-agent. Generate rigorous Chinese Markdown reports using public sources only.',
+          content: [
+            'You are report-agent. Generate rigorous Chinese Markdown reports using public sources only.',
+            'If the task uses write-hb, operate silently: do not send assistant-visible progress, planning, research notes, summaries, or draft text while using tools.',
+            'For write-hb, any assistant message that calls tools must contain no visible text. The final assistant message must contain exactly one REPORT_FILE line.',
+          ].join('\n'),
         },
         { role: 'user', content: prompt },
       ],
@@ -244,7 +248,8 @@ export class OpenClawService {
       })
       .join('\n');
 
-    const skillLabel = input.skill === 'risk-assessment-reports' ? '风险评估报告' : '人物情报报告';
+    const skillLabel = this.getSkillLabel(input);
+    const extraRequirements = this.getSkillRequirements(input);
 
     return [
       `请使用 OpenClaw Skill: ${input.skill} 生成${skillLabel}。`,
@@ -260,7 +265,32 @@ export class OpenClawService {
       '3. 输出完整 Markdown 报告。',
       '4. 报告末尾列出来源、可信度和信息缺口。',
       `5. 如需写入文件，只能写入目录：${OPENCLAW_CONTAINER_REPORT_DIR}。`,
+      ...extraRequirements,
     ].join('\n');
+  }
+
+  private getSkillLabel(input: RunInput): string {
+    if (input.skill === 'risk-assessment-reports') return '风险评估报告';
+    if (input.skill === 'person-intelligence-report') return '人物情报报告';
+    if (input.skill === 'write-hb') {
+      const reportType = typeof input.payload.report_type === 'string' ? input.payload.report_type : 'K报/HB报';
+      return `${reportType}现场调研报告`;
+    }
+    return '报告';
+  }
+
+  private getSkillRequirements(input: RunInput): string[] {
+    if (input.skill !== 'write-hb') return [];
+
+    const reportType = typeof input.payload.report_type === 'string' ? input.payload.report_type : 'K报或HB报';
+    return [
+      `6. write-hb 的 report_type 为 ${reportType}，必须按该报种对应大纲撰写，不要混用 K报 与 HB报 结构。`,
+      '7. Tavily 搜索必须通过 exec 调用容器内脚本：node /home/node/.openclaw/workspace/skills/tavily-search/scripts/search.mjs。',
+      '8. 正文提取必须通过 exec 调用容器内脚本：node /home/node/.openclaw/workspace/skills/tavily-search/scripts/extract.mjs。',
+      `9. 必须把完整成稿 Markdown 写入 ${OPENCLAW_CONTAINER_REPORT_DIR} 下的 .md 文件；不要只在对话中输出正文。`,
+      `10. 静默执行：调研、检索、提取、规划、草稿、进度说明都不要发送到对话；不要输出“任务已启动”“正在检索”“获取了足够素材”等中间文本。`,
+      `11. 最终对话只输出一行：REPORT_FILE: ${OPENCLAW_CONTAINER_REPORT_DIR}/实际文件名.md。除这一行外不要输出摘要、正文、来源表或其他说明。`,
+    ];
   }
 
   private buildReportLabel(input: RunInput): string {
@@ -271,7 +301,9 @@ export class OpenClawService {
           ? input.payload.targetName
           : typeof input.payload.subject === 'string'
             ? input.payload.subject
-            : undefined;
+            : typeof input.payload.topic === 'string'
+              ? input.payload.topic
+              : undefined;
     return name ? `${input.skill}: ${name}` : input.skill;
   }
 
