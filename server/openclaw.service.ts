@@ -1,5 +1,7 @@
 import { Injectable } from '@nestjs/common';
+import fs from 'fs';
 import OpenAI from 'openai';
+import path from 'path';
 import {
   HEALTH_TIMEOUT_MS,
   OPENCLAW_API_KEY,
@@ -7,6 +9,7 @@ import {
   OPENCLAW_CONTAINER_REPORT_DIR,
   OPENCLAW_HEALTH_URL,
   OPENCLAW_MODEL,
+  OPENCLAW_STATE_DIR,
   REPORT_TIMEOUT_MS,
 } from './config.js';
 import { OpenClawGatewayDeviceService } from './openclaw-gateway-device.service.js';
@@ -160,6 +163,9 @@ export class OpenClawService {
 
   async runReportViaGateway(input: RunInput): Promise<RunResult> {
     const prompt = this.buildReportPrompt(input);
+    const sessionKey = this.buildGatewaySessionKey(input);
+    const seenSessionEvents = new Set<string>();
+    const flushSessionEvents = () => this.forwardSessionToolEvents(sessionKey, input.onEvent, seenSessionEvents);
     input.onEvent({ type: 'stage', stage: 'start', message: 'Preparing OpenClaw Gateway device request...' });
     input.onEvent({
       type: 'stage',
@@ -167,13 +173,23 @@ export class OpenClawService {
       message: `Running OpenClaw report-agent through paired Gateway device (timeout ${Math.ceil(REPORT_TIMEOUT_MS / 1000)}s)...`,
     });
 
-    const agentPayload = await this.gatewayDevice.runAgent({
-      agentId: 'report-agent',
-      message: prompt,
-      timeoutMs: REPORT_TIMEOUT_MS,
-      label: this.buildReportLabel(input),
-      onEvent: (event) => this.forwardGatewayEvent(event, input.onEvent),
-    });
+    const pollTimer = setInterval(flushSessionEvents, 2000);
+    pollTimer.unref?.();
+
+    let agentPayload: unknown;
+    try {
+      agentPayload = await this.gatewayDevice.runAgent({
+        agentId: 'report-agent',
+        message: prompt,
+        timeoutMs: REPORT_TIMEOUT_MS,
+        sessionKey,
+        label: this.buildReportLabel(input),
+        onEvent: (event) => this.forwardGatewayEvent(event, input.onEvent),
+      });
+    } finally {
+      clearInterval(pollTimer);
+      flushSessionEvents();
+    }
 
     const markdown = this.extractAgentMarkdown(agentPayload);
     if (!markdown) {
@@ -310,6 +326,10 @@ export class OpenClawService {
     return name ? `${input.skill}: ${name}` : input.skill;
   }
 
+  private buildGatewaySessionKey(input: RunInput): string {
+    return `agent:report-agent:openai-user:${input.requestUser || cryptoSafeLabel(this.buildReportLabel(input))}`;
+  }
+
   private extractCompletionText(completion: OpenAI.Chat.Completions.ChatCompletion): string {
     return completion.choices
       .map((choice) => {
@@ -359,6 +379,135 @@ export class OpenClawService {
       const message = this.summarizeLifecycleEvent(phase, data);
       if (phase) onEvent({ type: 'stage', stage: `openclaw:${phase}`, message });
     }
+  }
+
+  private forwardSessionToolEvents(
+    sessionKey: string,
+    onEvent: (event: ServerEvent) => void,
+    seen: Set<string>,
+  ): void {
+    const jsonlPath = this.resolveSessionJsonlPath(sessionKey);
+    if (!jsonlPath) return;
+
+    const toolCalls = new Map<string, { name: string; args: Record<string, unknown>; emittedStart: boolean }>();
+    const lines = fs.readFileSync(jsonlPath, 'utf8').split(/\r?\n/).filter(Boolean);
+
+    for (const line of lines) {
+      const item = this.parseJsonLine(line);
+      const message = item?.message && typeof item.message === 'object' ? (item.message as Record<string, unknown>) : undefined;
+      if (!message) continue;
+
+      if (message.role === 'assistant' && Array.isArray(message.content)) {
+        for (const content of message.content) {
+          if (!content || typeof content !== 'object') continue;
+          const call = content as Record<string, unknown>;
+          if (call.type !== 'toolCall') continue;
+          const id = typeof call.id === 'string' ? call.id : `${String(item?.id || 'tool')}-${toolCalls.size}`;
+          const name = typeof call.name === 'string' ? call.name : 'tool';
+          const args = this.parseMaybeObject(call.arguments) || {};
+          toolCalls.set(id, { name, args, emittedStart: false });
+          if (!/read/i.test(name)) this.emitSessionToolStart(id, name, args, onEvent, seen, toolCalls);
+        }
+      }
+
+      if (message.role === 'toolResult') {
+        const id = typeof message.toolCallId === 'string' ? message.toolCallId : '';
+        const stored = toolCalls.get(id);
+        const name = typeof message.toolName === 'string' ? message.toolName : stored?.name || 'tool';
+        const args = stored?.args || {};
+        if (/read/i.test(name) && !stored?.emittedStart) {
+          const range = this.inferReadRangeFromToolResult(message);
+          this.emitSessionToolStart(id, name, { ...args, ...(range ? { startLine: range.start, endLine: range.end } : {}) }, onEvent, seen, toolCalls);
+        }
+        this.emitSessionToolEnd(id, name, onEvent, seen);
+      }
+    }
+  }
+
+  private resolveSessionJsonlPath(sessionKey: string): string | null {
+    try {
+      const sessionsPath = path.join(OPENCLAW_STATE_DIR, 'agents', 'report-agent', 'sessions', 'sessions.json');
+      const sessions = JSON.parse(fs.readFileSync(sessionsPath, 'utf8')) as Record<string, { sessionId?: unknown }>;
+      const sessionId = sessions[sessionKey]?.sessionId;
+      if (typeof sessionId !== 'string' || !sessionId) return null;
+      const jsonlPath = path.join(OPENCLAW_STATE_DIR, 'agents', 'report-agent', 'sessions', `${sessionId}.jsonl`);
+      return fs.existsSync(jsonlPath) ? jsonlPath : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private parseJsonLine(line: string): Record<string, unknown> | null {
+    try {
+      const parsed = JSON.parse(line) as unknown;
+      return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private emitSessionToolStart(
+    id: string,
+    name: string,
+    args: Record<string, unknown>,
+    onEvent: (event: ServerEvent) => void,
+    seen: Set<string>,
+    toolCalls: Map<string, { name: string; args: Record<string, unknown>; emittedStart: boolean }>,
+  ): void {
+    const key = `start:${id}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const stored = toolCalls.get(id);
+    if (stored) stored.emittedStart = true;
+    const data = { phase: 'call', name, arguments: args };
+    const summary = this.summarizeToolEvent(data);
+    onEvent({
+      type: 'tool_start',
+      id,
+      name,
+      raw: {
+        phase: 'call',
+        status: 'started',
+        label: summary.label,
+        summary: summary.summary,
+        command: summary.command,
+      },
+    });
+  }
+
+  private emitSessionToolEnd(
+    id: string,
+    name: string,
+    onEvent: (event: ServerEvent) => void,
+    seen: Set<string>,
+  ): void {
+    const key = `end:${id}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const summary = this.summarizeToolEvent({ phase: 'output', name });
+    onEvent({
+      type: 'tool_end',
+      id,
+      name,
+      raw: {
+        phase: 'output',
+        status: 'completed',
+        label: summary.label,
+        summary: summary.summary,
+        command: '',
+      },
+    });
+  }
+
+  private inferReadRangeFromToolResult(message: Record<string, unknown>): { start: number; end: number } | null {
+    const content = Array.isArray(message.content) ? message.content : [];
+    const text = content
+      .map((item) => (item && typeof item === 'object' ? (item as Record<string, unknown>).text : undefined))
+      .filter((value): value is string => typeof value === 'string')
+      .join('\n');
+    if (!text) return null;
+    const lineCount = text.split(/\r?\n/).length;
+    return { start: 1, end: Math.min(50, lineCount) };
   }
 
   private extractToolName(data: Record<string, unknown>): string | undefined {
@@ -668,4 +817,12 @@ export class OpenClawService {
     }
     return Array.from(commands);
   }
+}
+
+function cryptoSafeLabel(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'report';
 }
