@@ -364,11 +364,14 @@ export class OpenClawService {
   private extractToolName(data: Record<string, unknown>): string | undefined {
     const direct = typeof data.name === 'string' ? data.name : '';
     const toolName = typeof data.toolName === 'string' ? data.toolName : '';
+    const type = typeof data.type === 'string' ? data.type : '';
     const command = this.extractCommand(data);
-    const candidate = direct || toolName;
+    const candidate = direct || toolName || type;
     if (candidate) return candidate;
     if (/search\.mjs/i.test(command)) return 'tavily-search';
     if (/extract\.mjs/i.test(command)) return 'tavily-extract';
+    if (this.extractReadPath(data)) return 'read';
+    if (this.extractWritePath(data)) return 'write';
     if (/\bnode\b|\bpython\b|\bbash\b|\bsh\b/i.test(command)) return 'exec';
     return undefined;
   }
@@ -376,11 +379,12 @@ export class OpenClawService {
   private summarizeToolEvent(data: Record<string, unknown>) {
     const phase = typeof data.phase === 'string' ? data.phase : '';
     const name = this.extractToolName(data) || 'tool';
-    const command = this.sanitizeText(this.extractCommand(data), 180);
+    const detail = this.describeToolCall(name, data);
+    const command = this.sanitizeText(detail || this.extractCommand(data), 220);
     const output = this.extractOutputText(data);
     const status = this.detectToolStatus(data, phase, output);
     const label = this.labelTool(name, command);
-    const summary = this.buildToolSummary(name, phase, status, command, output);
+    const summary = this.buildToolSummary(name, phase, status, command, output, detail);
     return { status, label, command, summary };
   }
 
@@ -403,8 +407,9 @@ export class OpenClawService {
     return 'running';
   }
 
-  private buildToolSummary(name: string, phase: string, status: string, command: string, output: string): string {
+  private buildToolSummary(name: string, phase: string, status: string, command: string, output: string, detail = ''): string {
     if (status === 'started') {
+      if (detail) return detail;
       if (/search\.mjs/i.test(command)) return `Searching public sources${this.extractQuotedQuery(command)}.`;
       if (/extract\.mjs/i.test(command)) return 'Extracting selected source pages.';
       if (/write/i.test(name)) return 'Writing the report file.';
@@ -417,6 +422,9 @@ export class OpenClawService {
       return this.sanitizeText(text, 220);
     }
 
+    if (/read/i.test(name)) return 'Read completed.';
+    if (/write/i.test(name)) return 'Write completed.';
+    if (/exec/i.test(name)) return 'Command completed.';
     if (/search\.mjs/i.test(command) || /tavily-search/i.test(name)) {
       const count = this.countSearchResults(output);
       return count ? `Search completed with ${count} candidate sources.` : 'Search completed; candidate sources were returned.';
@@ -425,8 +433,6 @@ export class OpenClawService {
       const failures = (output.match(/failed/gi) || []).length;
       return failures ? `Extraction completed with ${failures} failed URL(s); usable content was retained.` : 'Source extraction completed.';
     }
-    if (/write/i.test(name)) return 'Report file write completed.';
-    if (/read/i.test(name)) return 'Report artifact read completed.';
     if (phase) return `${this.labelTool(name, command)} ${status}.`;
     return this.sanitizeText(output || `${this.labelTool(name, command)} completed.`, 220);
   }
@@ -434,10 +440,114 @@ export class OpenClawService {
   private labelTool(name: string, command: string): string {
     if (/search\.mjs/i.test(command) || /tavily-search/i.test(name)) return 'Tavily Search';
     if (/extract\.mjs/i.test(command) || /tavily-extract/i.test(name)) return 'Tavily Extract';
-    if (/write/i.test(name)) return 'File Write';
-    if (/read/i.test(name)) return 'File Read';
+    if (/write/i.test(name)) return 'Write';
+    if (/read/i.test(name)) return 'Read';
     if (/exec/i.test(name)) return 'Exec';
     return name;
+  }
+
+  private describeToolCall(name: string, data: Record<string, unknown>): string {
+    if (/read/i.test(name)) {
+      const filePath = this.extractReadPath(data);
+      const range = this.extractReadRange(data);
+      return filePath ? `${range ? `with ${range} from ` : 'from '}${this.sanitizePathForLog(filePath)}` : '';
+    }
+
+    if (/write/i.test(name)) {
+      const filePath = this.extractWritePath(data);
+      return filePath ? `to ${this.sanitizePathForLog(filePath)}` : '';
+    }
+
+    const command = this.extractCommand(data);
+    if (command) return this.sanitizeText(command, 220);
+
+    const args = this.extractToolArgs(data);
+    if (Object.keys(args).length === 0) return '';
+    return this.sanitizeText(JSON.stringify(this.sanitizeToolArgs(args)), 220);
+  }
+
+  private extractReadPath(data: Record<string, unknown>): string {
+    const args = this.extractToolArgs(data);
+    return this.firstString(args, ['path', 'file', 'filepath', 'filePath', 'target', 'uri']);
+  }
+
+  private extractWritePath(data: Record<string, unknown>): string {
+    const args = this.extractToolArgs(data);
+    return this.firstString(args, ['path', 'file', 'filepath', 'filePath', 'target', 'uri', 'output', 'outputPath']);
+  }
+
+  private extractReadRange(data: Record<string, unknown>): string {
+    const args = this.extractToolArgs(data);
+    const start = this.firstNumber(args, ['start', 'lineStart', 'startLine', 'from', 'offset']);
+    const end = this.firstNumber(args, ['end', 'lineEnd', 'endLine', 'to', 'limit']);
+    if (start !== undefined && end !== undefined) return `lines ${start}-${end}`;
+    if (start !== undefined) return `from line ${start}`;
+    if (end !== undefined) return `first ${end} lines`;
+    return '';
+  }
+
+  private extractToolArgs(data: Record<string, unknown>): Record<string, unknown> {
+    const keys = ['params', 'arguments', 'args', 'input', 'request'];
+    for (const key of keys) {
+      const value = data[key];
+      const parsed = this.parseMaybeObject(value);
+      if (parsed) return parsed;
+    }
+    const toolCall = data.toolCall && typeof data.toolCall === 'object' ? (data.toolCall as Record<string, unknown>) : undefined;
+    if (toolCall) {
+      for (const key of keys) {
+        const parsed = this.parseMaybeObject(toolCall[key]);
+        if (parsed) return parsed;
+      }
+      const fn = toolCall.function && typeof toolCall.function === 'object' ? (toolCall.function as Record<string, unknown>) : undefined;
+      const parsed = fn ? this.parseMaybeObject(fn.arguments) : undefined;
+      if (parsed) return parsed;
+    }
+    return {};
+  }
+
+  private parseMaybeObject(value: unknown): Record<string, unknown> | undefined {
+    if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>;
+    if (typeof value !== 'string' || !value.trim()) return undefined;
+    const text = value.trim();
+    if (!text.startsWith('{')) return undefined;
+    try {
+      const parsed = JSON.parse(text) as unknown;
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private firstNumber(data: Record<string, unknown>, keys: string[]): number | undefined {
+    for (const key of keys) {
+      const value = data[key];
+      if (typeof value === 'number' && Number.isFinite(value)) return value;
+      if (typeof value === 'string' && /^\d+$/.test(value.trim())) return Number(value.trim());
+    }
+    return undefined;
+  }
+
+  private sanitizeToolArgs(args: Record<string, unknown>): Record<string, unknown> {
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(args)) {
+      if (/key|token|secret|password|authorization/i.test(key)) {
+        sanitized[key] = '<redacted>';
+      } else if (typeof value === 'string') {
+        sanitized[key] = this.sanitizeText(value, 120);
+      } else if (typeof value === 'number' || typeof value === 'boolean') {
+        sanitized[key] = value;
+      }
+    }
+    return sanitized;
+  }
+
+  private sanitizePathForLog(filePath: string): string {
+    const clean = filePath.replace(/\\/g, '/');
+    if (clean.startsWith('/home/node/.openclaw/workspace/')) return clean;
+    if (clean.startsWith('/home/node/.openclaw/')) return clean.replace(/^\/home\/node\/\.openclaw\/[^\s]+/, '<openclaw-path>');
+    if (clean.startsWith('/usr/docker/openclaw/')) return clean.replace(/^\/usr\/docker\/openclaw\/[^\s]+/, '<openclaw-host-path>');
+    return this.sanitizeText(clean, 180);
   }
 
   private countSearchResults(output: string): number {
