@@ -167,6 +167,7 @@ export class ReportsService {
 
       const message = error instanceof Error ? error.message : String(error);
       job.status = 'failed';
+      job.stage = 'failed';
       job.errorMessage = message;
       job.updatedAt = new Date().toISOString();
       await this.writeJobState(job);
