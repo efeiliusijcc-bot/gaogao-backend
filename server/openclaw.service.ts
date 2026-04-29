@@ -333,17 +333,166 @@ export class OpenClawService {
 
     if (stream === 'tool') {
       const phase = typeof data.phase === 'string' ? data.phase : '';
-      const id = typeof data.toolCallId === 'string' ? data.toolCallId : undefined;
-      const name = typeof data.name === 'string' ? data.name : undefined;
-      if (phase === 'start') onEvent({ type: 'tool_start', id, name, raw: data });
-      else if (phase === 'result') onEvent({ type: 'tool_end', id, name, raw: data });
-      else onEvent({ type: 'tool_delta', id, name, raw: data });
+      const id =
+        typeof data.toolCallId === 'string'
+          ? data.toolCallId
+          : typeof data.id === 'string'
+            ? data.id
+            : undefined;
+      const name = this.extractToolName(data);
+      const summary = this.summarizeToolEvent(data);
+      const raw = {
+        phase,
+        status: summary.status,
+        label: summary.label,
+        summary: summary.summary,
+        command: summary.command,
+      };
+      if (summary.status === 'failed') onEvent({ type: 'tool_error', id, name, message: summary.summary, raw });
+      else if (phase === 'start' || phase === 'call') onEvent({ type: 'tool_start', id, name, raw });
+      else if (phase === 'result' || phase === 'output' || phase === 'end' || phase === 'complete') onEvent({ type: 'tool_end', id, name, raw });
+      else onEvent({ type: 'tool_delta', id, name, raw });
     }
 
     if (stream === 'lifecycle') {
       const phase = typeof data.phase === 'string' ? data.phase : '';
-      if (phase) onEvent({ type: 'stage', stage: `openclaw:${phase}`, message: `OpenClaw ${phase}` });
+      const message = this.summarizeLifecycleEvent(phase, data);
+      if (phase) onEvent({ type: 'stage', stage: `openclaw:${phase}`, message });
     }
+  }
+
+  private extractToolName(data: Record<string, unknown>): string | undefined {
+    const direct = typeof data.name === 'string' ? data.name : '';
+    const toolName = typeof data.toolName === 'string' ? data.toolName : '';
+    const command = this.extractCommand(data);
+    const candidate = direct || toolName;
+    if (candidate) return candidate;
+    if (/search\.mjs/i.test(command)) return 'tavily-search';
+    if (/extract\.mjs/i.test(command)) return 'tavily-extract';
+    if (/\bnode\b|\bpython\b|\bbash\b|\bsh\b/i.test(command)) return 'exec';
+    return undefined;
+  }
+
+  private summarizeToolEvent(data: Record<string, unknown>) {
+    const phase = typeof data.phase === 'string' ? data.phase : '';
+    const name = this.extractToolName(data) || 'tool';
+    const command = this.sanitizeText(this.extractCommand(data), 180);
+    const output = this.extractOutputText(data);
+    const status = this.detectToolStatus(data, phase, output);
+    const label = this.labelTool(name, command);
+    const summary = this.buildToolSummary(name, phase, status, command, output);
+    return { status, label, command, summary };
+  }
+
+  private summarizeLifecycleEvent(phase: string, data: Record<string, unknown>): string {
+    const message = this.firstString(data, ['message', 'status', 'label']);
+    if (message) return this.sanitizeText(message, 180);
+    if (phase === 'start') return 'OpenClaw started the agent run.';
+    if (phase === 'complete' || phase === 'done') return 'OpenClaw completed the agent run.';
+    if (phase === 'error') return 'OpenClaw reported an agent run error.';
+    return `OpenClaw ${phase}`;
+  }
+
+  private detectToolStatus(data: Record<string, unknown>, phase: string, output: string): 'started' | 'completed' | 'failed' | 'running' {
+    const status = this.firstString(data, ['status', 'state']);
+    const error = this.firstString(data, ['error', 'message']);
+    if (/fail|error|rejected/i.test(status) || (phase === 'error') || /error|failed|missing/i.test(error)) return 'failed';
+    if (/error|failed|missing api key|unauthorized/i.test(output)) return 'failed';
+    if (phase === 'start' || phase === 'call') return 'started';
+    if (phase === 'result' || phase === 'output' || phase === 'end' || phase === 'complete') return 'completed';
+    return 'running';
+  }
+
+  private buildToolSummary(name: string, phase: string, status: string, command: string, output: string): string {
+    if (status === 'started') {
+      if (/search\.mjs/i.test(command)) return `Searching public sources${this.extractQuotedQuery(command)}.`;
+      if (/extract\.mjs/i.test(command)) return 'Extracting selected source pages.';
+      if (/write/i.test(name)) return 'Writing the report file.';
+      if (/read/i.test(name)) return 'Reading generated report artifacts.';
+      return command ? `Running ${this.labelTool(name, command)}.` : `Starting ${this.labelTool(name, command)}.`;
+    }
+
+    if (status === 'failed') {
+      const text = output || this.extractFailureHint(command) || `${this.labelTool(name, command)} failed.`;
+      return this.sanitizeText(text, 220);
+    }
+
+    if (/search\.mjs/i.test(command) || /tavily-search/i.test(name)) {
+      const count = this.countSearchResults(output);
+      return count ? `Search completed with ${count} candidate sources.` : 'Search completed; candidate sources were returned.';
+    }
+    if (/extract\.mjs/i.test(command) || /tavily-extract/i.test(name)) {
+      const failures = (output.match(/failed/gi) || []).length;
+      return failures ? `Extraction completed with ${failures} failed URL(s); usable content was retained.` : 'Source extraction completed.';
+    }
+    if (/write/i.test(name)) return 'Report file write completed.';
+    if (/read/i.test(name)) return 'Report artifact read completed.';
+    if (phase) return `${this.labelTool(name, command)} ${status}.`;
+    return this.sanitizeText(output || `${this.labelTool(name, command)} completed.`, 220);
+  }
+
+  private labelTool(name: string, command: string): string {
+    if (/search\.mjs/i.test(command) || /tavily-search/i.test(name)) return 'Tavily Search';
+    if (/extract\.mjs/i.test(command) || /tavily-extract/i.test(name)) return 'Tavily Extract';
+    if (/write/i.test(name)) return 'File Write';
+    if (/read/i.test(name)) return 'File Read';
+    if (/exec/i.test(name)) return 'Exec';
+    return name;
+  }
+
+  private countSearchResults(output: string): number {
+    const markdownItems = output.match(/^\s*-\s+\*\*/gm)?.length ?? 0;
+    if (markdownItems) return markdownItems;
+    const urls = output.match(/https?:\/\/\S+/g)?.length ?? 0;
+    return urls;
+  }
+
+  private extractQuotedQuery(command: string): string {
+    const match = command.match(/search\.mjs\s+"([^"]+)"/i) || command.match(/search\.mjs\s+'([^']+)'/i);
+    return match?.[1] ? ` for "${this.sanitizeText(match[1], 60)}"` : '';
+  }
+
+  private extractFailureHint(command: string): string {
+    if (/TAVILY_API_KEY/i.test(command)) return 'Tavily API key is missing.';
+    return '';
+  }
+
+  private extractCommand(data: Record<string, unknown>): string {
+    const command = this.firstString(data, ['command', 'cmd', 'input', 'args']);
+    if (command) return command;
+    const params = data.params && typeof data.params === 'object' ? (data.params as Record<string, unknown>) : undefined;
+    return params ? this.firstString(params, ['command', 'cmd', 'input', 'args']) : '';
+  }
+
+  private extractOutputText(data: Record<string, unknown>): string {
+    const result = data.result && typeof data.result === 'object' ? (data.result as Record<string, unknown>) : undefined;
+    const output =
+      this.firstString(data, ['summary', 'output', 'stdout', 'stderr', 'content', 'text', 'message', 'error']) ||
+      (result ? this.firstString(result, ['summary', 'output', 'stdout', 'stderr', 'content', 'text', 'message', 'error']) : '');
+    return this.sanitizeText(output, 600);
+  }
+
+  private firstString(data: Record<string, unknown>, keys: string[]): string {
+    for (const key of keys) {
+      const value = data[key];
+      if (typeof value === 'string' && value.trim()) return value.trim();
+      if (Array.isArray(value)) {
+        const joined = value.filter((item) => typeof item === 'string').join(' ');
+        if (joined.trim()) return joined.trim();
+      }
+    }
+    return '';
+  }
+
+  private sanitizeText(value: string, maxLength: number): string {
+    const redacted = value
+      .replace(/(api[_-]?key|token|secret|authorization|password)\s*[:=]\s*["']?[^"'\s,}]+/gi, '$1=<redacted>')
+      .replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/gi, 'Bearer <redacted>')
+      .replace(/\/home\/node\/\.openclaw\/workspace\/[^\s"'`]+/g, '<openclaw-workspace-path>')
+      .replace(/\/usr\/docker\/openclaw\/[^\s"'`]+/g, '<openclaw-host-path>')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return redacted.length > maxLength ? `${redacted.slice(0, maxLength - 1)}…` : redacted;
   }
 
   private extractAgentMarkdown(payload: unknown): string {

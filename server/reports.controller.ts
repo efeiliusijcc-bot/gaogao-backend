@@ -46,7 +46,7 @@ export class ReportsController {
     const stream = this.reports.getStream(jobId);
 
     return new Observable((subscriber) => {
-      if (!job || !stream) {
+      if (!job) {
         subscriber.next({ data: { type: 'error', message: 'Job not found' } as ServerEvent } as MessageEvent);
         subscriber.complete();
         return undefined;
@@ -58,6 +58,14 @@ export class ReportsController {
 
       if (job.status === 'succeeded' || job.status === 'failed' || job.status === 'cancelled') {
         subscriber.next({ data: { type: 'done', jobId } as ServerEvent } as MessageEvent);
+        subscriber.complete();
+        return undefined;
+      }
+
+      if (!stream) {
+        subscriber.next({
+          data: { type: 'error', message: 'Job event stream is unavailable after service restart.' } as ServerEvent,
+        } as MessageEvent);
         subscriber.complete();
         return undefined;
       }

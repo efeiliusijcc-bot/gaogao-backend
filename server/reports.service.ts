@@ -5,7 +5,7 @@ import { v4 as uuid } from 'uuid';
 import { OpenClawApprovalRequiredError, OpenClawService } from './openclaw.service.js';
 import { RemoteFileService } from './remote-file.service.js';
 import type { CreateJobRequest } from '../src/types/report.js';
-import type { JobRecord, ServerEvent } from './types.js';
+import type { JobRecord, RunInput, ServerEvent } from './types.js';
 
 @Injectable()
 export class ReportsService {
@@ -126,12 +126,24 @@ export class ReportsService {
 
     try {
       const requestUser = this.buildRequestUser(job);
-      const result = await this.openClaw.runReport({
+      const runInput: RunInput = {
         skill: job.skill,
         payload: job.payload as unknown as Record<string, unknown>,
         requestUser,
         onEvent: (event) => this.pushEvent(job, event),
-      });
+      };
+      let result;
+      try {
+        result = await this.openClaw.runReportViaGateway(runInput);
+      } catch (gatewayError) {
+        const message = gatewayError instanceof Error ? gatewayError.message : String(gatewayError);
+        this.pushEvent(job, {
+          type: 'stage',
+          stage: 'gateway_fallback',
+          message: `OpenClaw Gateway event stream unavailable; falling back to non-streaming generation. ${message}`,
+        });
+        result = await this.openClaw.runReport(runInput);
+      }
 
       const resolvedReport = await this.resolveOpenClawReportFile(result.markdown, startedAtMs);
       job.status = 'succeeded';
