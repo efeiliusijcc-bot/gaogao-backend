@@ -67,6 +67,18 @@ export interface ReportJob {
   updatedAt: string;
 }
 
+export interface ReportJobListResponse {
+  items: ReportJob[];
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  statusCounts?: {
+    succeeded: number;
+    running: number;
+  };
+}
+
 export interface OpenClawHealth {
   ok: boolean;
   status: 'ready' | 'degraded' | 'down';

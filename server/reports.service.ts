@@ -7,6 +7,15 @@ import { RemoteFileService } from './remote-file.service.js';
 import type { CreateJobRequest } from '../src/types/report.js';
 import type { JobRecord, RunInput, ServerEvent } from './types.js';
 
+type JobListTypeFilter = 'all' | 'write-hb-k' | 'write-hb-hb' | 'person-intelligence-report' | 'risk-assessment-reports';
+
+interface JobListOptions {
+  page?: string | number;
+  pageSize?: string | number;
+  type?: string;
+  q?: string;
+}
+
 @Injectable()
 export class ReportsService {
   private readonly jobs = new Map<string, JobRecord>();
@@ -42,8 +51,46 @@ export class ReportsService {
     return { jobId, status: job.status };
   }
 
-  listJobs() {
-    return Array.from(this.jobs.values()).map((job) => ({
+  listJobs(options: JobListOptions = {}) {
+    const page = this.parsePositiveInt(options.page, 1);
+    const pageSize = Math.min(this.parsePositiveInt(options.pageSize, 20), 100);
+    const type = this.normalizeTypeFilter(options.type);
+    const query = String(options.q ?? '').trim().toLowerCase();
+
+    const filtered = Array.from(this.jobs.values())
+      .filter((job) => type === 'all' || this.jobTypeKey(job) === type)
+      .filter((job) => !query || this.jobSearchText(job).includes(query))
+      .sort((a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime());
+
+    const total = filtered.length;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const safePage = Math.min(page, totalPages);
+    const start = (safePage - 1) * pageSize;
+    const items = filtered.slice(start, start + pageSize).map((job) => this.serializeJob(job));
+
+    return {
+      items,
+      total,
+      page: safePage,
+      pageSize,
+      totalPages,
+      statusCounts: {
+        succeeded: filtered.filter((job) => job.status === 'succeeded').length,
+        running: filtered.filter((job) => job.status === 'running' || job.status === 'queued').length,
+      },
+    };
+  }
+
+  getJob(jobId: string): JobRecord | undefined {
+    return this.jobs.get(jobId);
+  }
+
+  getStream(jobId: string): Subject<ServerEvent> | undefined {
+    return this.streams.get(jobId);
+  }
+
+  private serializeJob(job: JobRecord) {
+    return {
       jobId: job.jobId,
       skill: job.skill,
       payload: job.payload,
@@ -53,15 +100,54 @@ export class ReportsService {
       resultPath: job.resultPath,
       createdAt: job.createdAt,
       updatedAt: job.updatedAt,
-    }));
+    };
   }
 
-  getJob(jobId: string): JobRecord | undefined {
-    return this.jobs.get(jobId);
+  private parsePositiveInt(value: string | number | undefined, fallback: number): number {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+    return Math.floor(parsed);
   }
 
-  getStream(jobId: string): Subject<ServerEvent> | undefined {
-    return this.streams.get(jobId);
+  private normalizeTypeFilter(value: string | undefined): JobListTypeFilter {
+    const allowed = new Set<JobListTypeFilter>([
+      'all',
+      'write-hb-k',
+      'write-hb-hb',
+      'person-intelligence-report',
+      'risk-assessment-reports',
+    ]);
+    return allowed.has(value as JobListTypeFilter) ? (value as JobListTypeFilter) : 'all';
+  }
+
+  private jobTypeKey(job: JobRecord): JobListTypeFilter {
+    if (job.skill === 'write-hb') {
+      const reportType = String((job.payload as { report_type?: unknown }).report_type ?? '').toLowerCase();
+      return reportType.includes('hb') ? 'write-hb-hb' : 'write-hb-k';
+    }
+    if (job.skill === 'person-intelligence-report') return 'person-intelligence-report';
+    if (job.skill === 'risk-assessment-reports') return 'risk-assessment-reports';
+    return 'all';
+  }
+
+  private jobSearchText(job: JobRecord): string {
+    return [
+      job.jobId,
+      job.skill,
+      job.status,
+      job.stage,
+      job.errorMessage,
+      job.resultPath,
+      this.payloadSearchText(job.payload),
+    ].join(' ').toLowerCase();
+  }
+
+  private payloadSearchText(value: unknown): string {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value);
+    if (Array.isArray(value)) return value.map((item) => this.payloadSearchText(item)).join(' ');
+    if (typeof value === 'object') return Object.values(value).map((item) => this.payloadSearchText(item)).join(' ');
+    return '';
   }
 
   async getResult(jobId: string) {

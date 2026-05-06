@@ -17,8 +17,13 @@ export class ReportsController {
   }
 
   @Get()
-  list() {
-    return this.reports.listJobs();
+  list(
+    @Query('page') page?: string,
+    @Query('pageSize') pageSize?: string,
+    @Query('type') type?: string,
+    @Query('q') q?: string,
+  ) {
+    return this.reports.listJobs({ page, pageSize, type, q });
   }
 
   @Get(':jobId')
