@@ -65,7 +65,7 @@ docker run -d \
   -e OPENCLAW_REMOTE_HOST= \
   -e REPORT_OUTPUT_DIR=/home/node/.openclaw/workspace/report-agent/reports \
   -e OPENCLAW_REMOTE_REPORT_DIR=/home/node/.openclaw/workspace/report-agent/reports \
-  -v /usr/docker/openclaw/workspace/report-agent/reports:/home/node/.openclaw/workspace/report-agent/reports \
+  -v /usr/docker/openclaw:/home/node/.openclaw \
   gaogao-api:latest
 
 echo "=== 3. 等待启动 ==="
