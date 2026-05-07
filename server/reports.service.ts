@@ -5,7 +5,7 @@ import { v4 as uuid } from 'uuid';
 import { OpenClawApprovalRequiredError, OpenClawService } from './openclaw.service.js';
 import { RemoteFileService } from './remote-file.service.js';
 import type { CreateJobRequest } from '../src/types/report.js';
-import type { JobRecord, RunInput, ServerEvent } from './types.js';
+import type { EventLogEntry, JobRecord, RunInput, ServerEvent } from './types.js';
 
 type JobListTypeFilter = 'all' | 'write-hb-k' | 'write-hb-hb' | 'person-intelligence-report' | 'risk-assessment-reports';
 
@@ -41,6 +41,7 @@ export class ReportsService {
       createdAt: now,
       updatedAt: now,
       events: [],
+      eventLog: [],
     };
 
     this.jobs.set(jobId, job);
@@ -87,6 +88,12 @@ export class ReportsService {
 
   getStream(jobId: string): Subject<ServerEvent> | undefined {
     return this.streams.get(jobId);
+  }
+
+  getEventLog(jobId: string): { jobId: string; items: EventLogEntry[] } | undefined {
+    const job = this.jobs.get(jobId);
+    if (!job) return undefined;
+    return { jobId, items: job.eventLog ?? [] };
   }
 
   private serializeJob(job: JobRecord) {
@@ -277,10 +284,106 @@ export class ReportsService {
 
   private pushEvent(job: JobRecord, event: ServerEvent) {
     job.events.push(event);
+    const logEntry = this.toEventLogEntry(job, event);
+    if (logEntry) {
+      job.eventLog.push(logEntry);
+      if (job.eventLog.length > 500) job.eventLog = job.eventLog.slice(-500);
+    }
     if (event.type === 'stage') {
       job.stage = event.stage;
     }
     this.streams.get(job.jobId)?.next(event);
+    void this.writeJobState(job);
+  }
+
+  private toEventLogEntry(job: JobRecord, event: ServerEvent): EventLogEntry | null {
+    const now = new Date().toISOString();
+    const baseId = `${job.jobId}:${job.eventLog.length + 1}:${event.type}`;
+
+    if (event.type === 'stage') {
+      return {
+        id: `${baseId}:${event.stage}`,
+        time: now,
+        type: 'stage',
+        label: '阶段进度',
+        status: event.stage || 'running',
+        summary: this.sanitizeLogText(event.message || event.stage || 'OpenClaw 阶段更新', 220),
+      };
+    }
+
+    if (event.type === 'tool_start' || event.type === 'tool_end' || event.type === 'tool_error') {
+      const raw = event.raw && typeof event.raw === 'object' ? (event.raw as Record<string, unknown>) : {};
+      const status =
+        this.firstLogString(raw, ['status']) ||
+        (event.type === 'tool_start' ? 'started' : event.type === 'tool_end' ? 'completed' : 'failed');
+      const label = this.sanitizeLogText(this.firstLogString(raw, ['label']) || event.name || 'Tool', 80);
+      const summary = this.sanitizeLogText(
+        this.firstLogString(raw, ['summary']) ||
+          (event.type === 'tool_error' ? event.message : `${label} ${status}`),
+        220,
+      );
+      const command = this.sanitizeCommandForEventLog(this.firstLogString(raw, ['command']));
+      return {
+        id: `${baseId}:${event.id ?? job.eventLog.length + 1}`,
+        time: now,
+        type: event.type,
+        label,
+        status,
+        summary,
+        ...(command ? { command } : {}),
+      };
+    }
+
+    if (event.type === 'error') {
+      return {
+        id: baseId,
+        time: now,
+        type: 'error',
+        label: '任务错误',
+        status: 'failed',
+        summary: this.sanitizeLogText(event.message || '任务失败', 220),
+      };
+    }
+
+    if (event.type === 'done') {
+      return {
+        id: `${baseId}:${event.jobId}`,
+        time: now,
+        type: 'done',
+        label: '任务完成',
+        status: 'completed',
+        summary: '后端任务已结束。',
+      };
+    }
+
+    return null;
+  }
+
+  private firstLogString(value: Record<string, unknown>, keys: string[]): string {
+    for (const key of keys) {
+      const candidate = value[key];
+      if (typeof candidate === 'string' && candidate.trim()) return candidate;
+    }
+    return '';
+  }
+
+  private sanitizeCommandForEventLog(value: string): string {
+    if (!value) return '';
+    const sanitized = this.sanitizeLogText(value, 180)
+      .replace(/(?:\/home\/node\/\.openclaw\/workspace\/|\/usr\/docker\/openclaw\/workspace\/)/g, '.../')
+      .replace(/([A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|KEY)[A-Z0-9_]*=)[^\s"'`]+/gi, '$1[redacted]');
+    return sanitized;
+  }
+
+  private sanitizeLogText(value: string, maxLength: number): string {
+    const redacted = String(value)
+      .replace(/\b(api[_-]?key|token|secret|password|authorization)\b\s*[:=]\s*["']?[^"'\s,;}]+/gi, '$1=[redacted]')
+      .replace(/\b(?:sk|tp)-[a-zA-Z0-9_-]{16,}\b/g, '[redacted-key]')
+      .replace(/Bearer\s+[a-zA-Z0-9._-]+/gi, 'Bearer [redacted]')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (redacted.length <= maxLength) return redacted;
+    return `${redacted.slice(0, maxLength - 1)}…`;
   }
 
   private async writeReportFile(job: JobRecord, markdown: string): Promise<string> {
@@ -337,6 +440,7 @@ export class ReportsService {
                 resultPath: parsed.resultPath,
                 errorMessage: parsed.errorMessage,
                 events: [],
+                eventLog: Array.isArray(parsed.eventLog) ? parsed.eventLog.filter((item) => item && typeof item === 'object') as EventLogEntry[] : [],
               } as JobRecord);
             } catch {
               // Ignore corrupted persisted job files.

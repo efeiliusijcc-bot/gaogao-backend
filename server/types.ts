@@ -15,6 +15,17 @@ export interface JobRecord {
   createdAt: string;
   updatedAt: string;
   events: ServerEvent[];
+  eventLog: EventLogEntry[];
+}
+
+export interface EventLogEntry {
+  id: string;
+  time: string;
+  type: 'stage' | 'tool_start' | 'tool_end' | 'tool_error' | 'done' | 'error';
+  label: string;
+  status: string;
+  summary: string;
+  command?: string;
 }
 
 export type ServerEvent =

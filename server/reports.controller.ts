@@ -45,6 +45,15 @@ export class ReportsController {
     };
   }
 
+  @Get(':jobId/event-log')
+  eventLog(@Param('jobId') jobId: string) {
+    const result = this.reports.getEventLog(jobId);
+    if (!result) {
+      throw new HttpException({ error: 'Job not found' }, HttpStatus.NOT_FOUND);
+    }
+    return result;
+  }
+
   @Sse(':jobId/events')
   events(@Param('jobId') jobId: string): Observable<MessageEvent> {
     const job = this.reports.getJob(jobId);
