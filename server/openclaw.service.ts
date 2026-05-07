@@ -11,9 +11,10 @@ import {
   OPENCLAW_MODEL,
   OPENCLAW_STATE_DIR,
   REPORT_TIMEOUT_MS,
+  TAVILY_API_KEY,
 } from './config.js';
 import { OpenClawGatewayDeviceService } from './openclaw-gateway-device.service.js';
-import type { OpenClawHealth, RunInput, RunResult, ServerEvent } from './types.js';
+import type { OpenClawHealth, ReportPlanRequest, ReportPlanResponse, RunInput, RunResult, ServerEvent } from './types.js';
 
 export class OpenClawApprovalRequiredError extends Error {
   constructor(
@@ -100,6 +101,47 @@ export class OpenClawService {
     input.onEvent({ type: 'stage', stage: 'received', message: 'OpenClaw returned a complete non-streaming response.' });
     this.assertNoApprovalCommands(markdown);
     return { markdown, artifacts: {} };
+  }
+
+  async planReport(input: ReportPlanRequest): Promise<ReportPlanResponse> {
+    const fallback = this.buildFallbackPlan(input);
+    const searchFindings = await this.searchPlanningSources(fallback.searchQueries.slice(0, 3));
+    const prompt = [
+      '请为一个中文深度编报任务生成“规划搜索与子任务选择”方案。',
+      '只输出严格 JSON，不要输出 Markdown，不要解释。',
+      'JSON 字段必须是：title, summary, searchQueries, steps。',
+      'steps 每项字段：id, title, description, allowMultiple, options。',
+      'options 每项字段：id, label, detail, selected。',
+      '要求：',
+      '1. searchQueries 给出 4-6 个可用于公开信息检索的中文查询词。',
+      '2. steps 至少 3 步：检索方向、研判重点、输出口径。',
+      '3. 每步 3-5 个选项，允许多选，默认选中最重要的 2-3 个。',
+      '4. 选项要贴合报类和主题，不要泛泛而谈。',
+      '5. 不要包含 URL、密钥、环境变量或长正文。',
+      '',
+      `报类：${input.reportType}`,
+      `主题：${input.topic}`,
+      `补充上下文：${input.context || '无'}`,
+      `结构化参数：${JSON.stringify(input.parameters || {})}`,
+      `初步公开检索摘要：${searchFindings || '检索暂不可用，请按主题和上下文规划。'}`,
+    ].join('\n');
+
+    try {
+      const completion = await this.client.chat.completions.create({
+        model: OPENCLAW_MODEL,
+        stream: false,
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a precise report planning assistant. Return compact valid JSON only.',
+          },
+          { role: 'user', content: prompt },
+        ],
+      });
+      return this.normalizePlanResponse(this.extractCompletionText(completion), fallback);
+    } catch {
+      return fallback;
+    }
   }
 
   private async runReportSegmented(input: RunInput, basePrompt: string): Promise<RunResult> {
@@ -339,6 +381,145 @@ export class OpenClawService {
       })
       .join('\n\n')
       .trim();
+  }
+
+  private normalizePlanResponse(text: string, fallback: ReportPlanResponse): ReportPlanResponse {
+    try {
+      const jsonText = text.trim().replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
+      const parsed = JSON.parse(jsonText) as Partial<ReportPlanResponse>;
+      const steps = Array.isArray(parsed.steps)
+        ? parsed.steps
+            .map((step, stepIndex) => ({
+              id: this.safePlanId(step?.id, `step-${stepIndex + 1}`),
+              title: this.sanitizeText(String(step?.title || fallback.steps[stepIndex]?.title || `步骤 ${stepIndex + 1}`), 40),
+              description: this.sanitizeText(String(step?.description || ''), 120),
+              allowMultiple: step?.allowMultiple !== false,
+              options: Array.isArray(step?.options)
+                ? step.options.slice(0, 6).map((option, optionIndex) => ({
+                    id: this.safePlanId(option?.id, `option-${optionIndex + 1}`),
+                    label: this.sanitizeText(String(option?.label || `选项 ${optionIndex + 1}`), 40),
+                    detail: this.sanitizeText(String(option?.detail || ''), 120),
+                    selected: option?.selected !== false && optionIndex < 2,
+                  }))
+                : [],
+            }))
+            .filter((step) => step.options.length > 0)
+        : [];
+
+      return {
+        title: this.sanitizeText(String(parsed.title || fallback.title), 60),
+        summary: this.sanitizeText(String(parsed.summary || fallback.summary), 180),
+        searchQueries: Array.isArray(parsed.searchQueries)
+          ? parsed.searchQueries.map((item) => this.sanitizeText(String(item), 80)).filter(Boolean).slice(0, 8)
+          : fallback.searchQueries,
+        steps: steps.length ? steps : fallback.steps,
+      };
+    } catch {
+      return fallback;
+    }
+  }
+
+  private safePlanId(value: unknown, fallback: string): string {
+    const text = typeof value === 'string' ? value : fallback;
+    return text.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || fallback;
+  }
+
+  private buildFallbackPlan(input: ReportPlanRequest): ReportPlanResponse {
+    const topic = this.sanitizeText(input.topic || '未命名编报', 60);
+    const reportType = this.sanitizeText(input.reportType || 'report', 40);
+    return {
+      title: `${topic}：编报规划`,
+      summary: '已根据主题生成基础检索方向和研判子任务，请选择需要纳入正式编报的方向。',
+      searchQueries: [
+        `${topic} 最新进展`,
+        `${topic} 政策背景`,
+        `${topic} 风险影响`,
+        `${topic} 各方立场`,
+        `${topic} 应对建议`,
+      ],
+      steps: [
+        {
+          id: 'search-scope',
+          title: '检索方向',
+          description: '选择需要优先搜索和核验的信息范围。',
+          allowMultiple: true,
+          options: [
+            { id: 'background', label: '背景脉络', detail: '梳理事件起因、时间线和关键节点。', selected: true },
+            { id: 'latest', label: '最新动态', detail: '检索近期公开报道、政策变化和各方表态。', selected: true },
+            { id: 'stakeholders', label: '相关主体', detail: '识别国家、机构、企业、人物等核心相关方。', selected: false },
+            { id: 'data', label: '数据佐证', detail: '搜索可引用的数据、案例和公开文件。', selected: false },
+          ],
+        },
+        {
+          id: 'analysis-focus',
+          title: '研判重点',
+          description: '选择报告正文需要重点展开的分析角度。',
+          allowMultiple: true,
+          options: [
+            { id: 'risk', label: '风险识别', detail: '研判政治、经济、社会、舆情或安全风险。', selected: true },
+            { id: 'impact', label: '影响评估', detail: '分析对我方、地区或行业的潜在影响。', selected: true },
+            { id: 'trend', label: '趋势推演', detail: '给出短期和中期走向判断。', selected: false },
+            { id: 'gap', label: '信息缺口', detail: '标注尚需补充核验的信息。', selected: false },
+          ],
+        },
+        {
+          id: 'output-tone',
+          title: '输出口径',
+          description: '选择最终编报的写作侧重和成果形式。',
+          allowMultiple: true,
+          options: [
+            { id: 'structured', label: '结构化三段式', detail: '按基本情况、风险研判、对策建议组织。', selected: reportType.includes('write-hb') },
+            { id: 'briefing', label: '领导参阅口径', detail: '突出结论先行、简洁可读和建议可执行。', selected: true },
+            { id: 'evidence', label: '来源可追溯', detail: '强化来源编号、可信度和信息缺口说明。', selected: true },
+            { id: 'action', label: '处置建议', detail: '输出可落地的工作预案和后续跟踪方向。', selected: false },
+          ],
+        },
+      ],
+    };
+  }
+
+  private async searchPlanningSources(queries: string[]): Promise<string> {
+    if (!TAVILY_API_KEY || queries.length === 0) return '';
+    const findings: string[] = [];
+
+    for (const query of queries) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);
+      try {
+        const response = await fetch('https://api.tavily.com/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            api_key: TAVILY_API_KEY,
+            query,
+            search_depth: 'basic',
+            max_results: 3,
+            include_answer: true,
+          }),
+        });
+        clearTimeout(timer);
+        if (!response.ok) continue;
+        const data = (await response.json()) as {
+          answer?: unknown;
+          results?: Array<{ title?: unknown; content?: unknown }>;
+        };
+        const lines = [
+          typeof data.answer === 'string' ? data.answer : '',
+          ...(Array.isArray(data.results)
+            ? data.results.map((item) => `${String(item.title || '')} ${String(item.content || '')}`)
+            : []),
+        ]
+          .map((item) => this.sanitizeText(item, 180))
+          .filter(Boolean)
+          .slice(0, 3);
+        if (lines.length) findings.push(`查询：${query}\n${lines.map((line) => `- ${line}`).join('\n')}`);
+      } catch {
+        clearTimeout(timer);
+      }
+    }
+
+    return findings.join('\n\n').slice(0, 2400);
   }
 
   private forwardGatewayEvent(

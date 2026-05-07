@@ -64,3 +64,32 @@ export interface OpenClawHealth {
   timeoutMs: number;
   details: string[];
 }
+
+export interface ReportPlanRequest {
+  topic: string;
+  reportType: string;
+  context?: string;
+  parameters?: Record<string, string>;
+}
+
+export interface ReportPlanOption {
+  id: string;
+  label: string;
+  detail: string;
+  selected?: boolean;
+}
+
+export interface ReportPlanStep {
+  id: string;
+  title: string;
+  description: string;
+  allowMultiple: boolean;
+  options: ReportPlanOption[];
+}
+
+export interface ReportPlanResponse {
+  title: string;
+  summary: string;
+  searchQueries: string[];
+  steps: ReportPlanStep[];
+}

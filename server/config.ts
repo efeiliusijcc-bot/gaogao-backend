@@ -47,3 +47,4 @@ export const OPENCLAW_REMOTE_REPORT_DIR =
   process.env.OPENCLAW_REMOTE_REPORT_DIR || '/usr/docker/openclaw/workspace/report-agent/reports';
 export const OPENCLAW_CONTAINER_REPORT_DIR =
   '/home/node/.openclaw/workspace/report-agent/reports';
+export const TAVILY_API_KEY = process.env.TAVILY_API_KEY || '';
