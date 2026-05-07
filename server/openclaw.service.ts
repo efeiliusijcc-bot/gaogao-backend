@@ -138,7 +138,8 @@ export class OpenClawService {
           { role: 'user', content: prompt },
         ],
       });
-      return this.normalizePlanResponse(this.extractCompletionText(completion), fallback);
+      const plan = this.normalizePlanResponse(this.extractCompletionText(completion), fallback);
+      return this.isPlanRelevant(input.topic, plan) ? plan : fallback;
     } catch {
       return fallback;
     }
@@ -476,6 +477,28 @@ export class OpenClawService {
         },
       ],
     };
+  }
+
+  private isPlanRelevant(topic: string, plan: ReportPlanResponse): boolean {
+    const terms = String(topic)
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .split(/\s+/)
+      .map((item) => item.trim())
+      .filter((item) => item.length >= 2);
+    if (terms.length === 0) return true;
+
+    const haystack = [
+      plan.title,
+      plan.summary,
+      ...(plan.searchQueries || []),
+      ...(plan.steps || []).flatMap((step) => [
+        step.title,
+        step.description,
+        ...(step.options || []).flatMap((option) => [option.label, option.detail]),
+      ]),
+    ].join('\n');
+
+    return terms.some((term) => haystack.includes(term));
   }
 
   private async searchPlanningSources(queries: string[]): Promise<string> {
