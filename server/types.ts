@@ -79,8 +79,16 @@ export interface ReportPlanOption {
   selected?: boolean;
 }
 
+export type ReportPlanStepType =
+  | 'search_queries'
+  | 'source_scope'
+  | 'basic_info_module'
+  | 'analysis_module'
+  | 'output_module';
+
 export interface ReportPlanStep {
   id: string;
+  type: ReportPlanStepType;
   title: string;
   description: string;
   allowMultiple: boolean;

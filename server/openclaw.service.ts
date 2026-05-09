@@ -15,6 +15,7 @@ import {
 } from './config.js';
 import { OpenClawGatewayDeviceService } from './openclaw-gateway-device.service.js';
 import type { OpenClawHealth, ReportPlanRequest, ReportPlanResponse, RunInput, RunResult, ServerEvent } from './types.js';
+import type { ReportPlanStepType } from './types.js';
 
 export class OpenClawApprovalRequiredError extends Error {
   constructor(
@@ -110,14 +111,15 @@ export class OpenClawService {
       '请为一个中文深度编报任务生成“规划搜索与子任务选择”方案。',
       '只输出严格 JSON，不要输出 Markdown，不要解释。',
       'JSON 字段必须是：title, summary, searchQueries, steps。',
-      'steps 每项字段：id, title, description, allowMultiple, options。',
+      'steps 每项字段：id, type, title, description, allowMultiple, options。',
       'options 每项字段：id, label, detail, selected。',
       '要求：',
       '1. searchQueries 给出 4-6 个可用于公开信息检索的中文查询词。',
-      '2. steps 至少 3 步：检索方向、研判重点、输出口径。',
+      '2. steps 必须覆盖 source_scope、basic_info_module、analysis_module、output_module 四类；type 只能使用 search_queries、source_scope、basic_info_module、analysis_module、output_module。',
       '3. 每步 3-5 个选项，允许多选，默认选中最重要的 2-3 个。',
       '4. 选项要贴合报类和主题，不要泛泛而谈。',
       '5. 不要包含 URL、密钥、环境变量或长正文。',
+      '6. source_scope 用于让用户选择信源范围；basic_info_module 用于选择基本信息正文模块；analysis_module 用于选择研判模块；output_module 用于选择最终输出口径。',
       '',
       `报类：${input.reportType}`,
       `主题：${input.topic}`,
@@ -300,12 +302,7 @@ export class OpenClawService {
     };
 
     const yamlPayload = Object.entries(payloadWithOutput)
-      .map(([key, value]) => {
-        if (Array.isArray(value)) {
-          return `${key}:\n${value.map((item) => `  - ${String(item)}`).join('\n')}`;
-        }
-        return `${key}: ${String(value)}`;
-      })
+      .map(([key, value]) => this.formatPromptPayloadValue(key, value))
       .join('\n');
 
     const skillLabel = this.getSkillLabel(input);
@@ -339,19 +336,35 @@ export class OpenClawService {
     return '报告';
   }
 
+  private formatPromptPayloadValue(key: string, value: unknown): string {
+    if (Array.isArray(value)) {
+      return `${key}:\n${value.map((item) => `  - ${String(item)}`).join('\n')}`;
+    }
+
+    const text = typeof value === 'string' ? value : JSON.stringify(value);
+    if (text.includes('\n') || text.trim().startsWith('{') || text.trim().startsWith('[')) {
+      return `${key}: |\n${text.split('\n').map((line) => `  ${line}`).join('\n')}`;
+    }
+
+    return `${key}: ${text}`;
+  }
+
   private getSkillRequirements(input: RunInput): string[] {
     if (input.skill !== 'write-hb') return [];
 
     const reportType = typeof input.payload.report_type === 'string' ? input.payload.report_type : 'K报或HB报';
     return [
       `6. write-hb 的 report_type 为 ${reportType}，必须按该报种对应大纲撰写，不要混用 K报 与 HB报 结构。`,
-      '7. Tavily 搜索必须通过 exec 调用容器内脚本：node /home/node/.openclaw/workspace/skills/tavily-search/scripts/search.mjs。',
-      '8. 正文提取必须通过 exec 调用容器内脚本：node /home/node/.openclaw/workspace/skills/tavily-search/scripts/extract.mjs。',
-      `9. 必须把完整成稿 Markdown 写入 ${OPENCLAW_CONTAINER_REPORT_DIR} 下的 .md 文件；不要只在对话中输出正文。`,
-      `10. 静默执行：调研、检索、提取、规划、草稿、进度说明都不要发送到对话；不要输出“任务已启动”“正在检索”“获取了足够素材”等中间文本。`,
-      `11. 最终对话只输出一行：REPORT_FILE: ${OPENCLAW_CONTAINER_REPORT_DIR}/实际文件名.md。除这一行外不要输出摘要、正文、来源表或其他说明。`,
-      '12. 最终保存的 Markdown 正文、标题、来源、文件名均不得包含 Unicode 替换字符 U+FFFD、连续替换字符、\\ufffd 或明显乱码；如素材中有乱码，必须改写为语义完整的中文句子后再保存。',
-      '13. 正文段落不得出现 http:// 或 https:// 原始网址；正文引用只写来源机构、发布时间和参考资料编号，完整 URL 只放在文末参考资料部分。',
+      '7. known_context 如果是 JSON，必须先解析其 selectedSearchQueries、userProvidedSources、selectedModules、parameterValues、supplement；如果解析失败，再按普通文本上下文处理。',
+      '8. Research Phase：优先使用 web-research-firecrawl 进行前置研究。若用户提供 userProvidedSources 或 selectedSources，先围绕这些信源/机构/URL 抽取和核验；再围绕 selectedSearchQueries 做公开检索。推荐通过 exec 调用：python3 /home/node/.openclaw/workspace/report-agent/skills/web-research-firecrawl/scripts/research_cli.py brief --query "检索词" --max-sources 8 --instruction "围绕用户选中的编报模块提取证据、关键信息、待核验项"。',
+      '9. Research Phase 输出必须形成内部素材：sources、evidence_cards、key_findings、verification_needed 和信息缺口；不要把完整网页正文、长 stdout/stderr 或研究草稿发送到对话。',
+      '10. Firecrawl/Exa/Tavily triad 不可用时，允许回退到 write-hb 原 Tavily 调研流程：node /home/node/.openclaw/workspace/skills/tavily-search/scripts/search.mjs 和 extract.mjs，并在内部记录“Firecrawl 不可用，已回退”。',
+      '11. Write-HB Phase：只在 Research Phase 完成后，基于前置研究结果和用户 selectedModules，按 write-hb 的 K报/HB报大纲撰写完整成稿；不得把未选模块强行作为正文重点。',
+      `12. 必须把完整成稿 Markdown 写入 ${OPENCLAW_CONTAINER_REPORT_DIR} 下的 .md 文件；不要只在对话中输出正文。`,
+      `13. 静默执行：调研、检索、提取、规划、草稿、进度说明都不要发送到对话；不要输出“任务已启动”“正在检索”“获取了足够素材”等中间文本。`,
+      `14. 最终对话只输出一行：REPORT_FILE: ${OPENCLAW_CONTAINER_REPORT_DIR}/实际文件名.md。除这一行外不要输出摘要、正文、来源表或其他说明。`,
+      '15. 最终保存的 Markdown 正文、标题、来源、文件名均不得包含 Unicode 替换字符 U+FFFD、连续替换字符、\\ufffd 或明显乱码；如素材中有乱码，必须改写为语义完整的中文句子后再保存。',
+      '16. 正文段落不得出现 http:// 或 https:// 原始网址；正文引用只写来源机构、发布时间和参考资料编号，完整 URL 只放在文末参考资料部分。',
     ];
   }
 
@@ -392,6 +405,7 @@ export class OpenClawService {
         ? parsed.steps
             .map((step, stepIndex) => ({
               id: this.safePlanId(step?.id, `step-${stepIndex + 1}`),
+              type: this.safePlanStepType((step as { type?: unknown } | undefined)?.type, fallback.steps[stepIndex]?.type),
               title: this.sanitizeText(String(step?.title || fallback.steps[stepIndex]?.title || `步骤 ${stepIndex + 1}`), 40),
               description: this.sanitizeText(String(step?.description || ''), 120),
               allowMultiple: step?.allowMultiple !== false,
@@ -400,12 +414,14 @@ export class OpenClawService {
                     id: this.safePlanId(option?.id, `option-${optionIndex + 1}`),
                     label: this.sanitizeText(String(option?.label || `选项 ${optionIndex + 1}`), 40),
                     detail: this.sanitizeText(String(option?.detail || ''), 120),
-                    selected: option?.selected !== false && optionIndex < 2,
+                    selected: typeof option?.selected === 'boolean' ? option.selected : optionIndex < 3,
                   }))
                 : [],
             }))
             .filter((step) => step.options.length > 0)
         : [];
+
+      const normalizedSteps = steps.length ? this.ensurePlanStepTypes(steps, fallback.steps) : fallback.steps;
 
       return {
         title: this.sanitizeText(String(parsed.title || fallback.title), 60),
@@ -413,11 +429,23 @@ export class OpenClawService {
         searchQueries: Array.isArray(parsed.searchQueries)
           ? parsed.searchQueries.map((item) => this.sanitizeText(String(item), 80)).filter(Boolean).slice(0, 8)
           : fallback.searchQueries,
-        steps: steps.length ? steps : fallback.steps,
+        steps: normalizedSteps,
       };
     } catch {
       return fallback;
     }
+  }
+
+  private ensurePlanStepTypes(steps: ReportPlanResponse['steps'], fallbackSteps: ReportPlanResponse['steps']): ReportPlanResponse['steps'] {
+    const required: ReportPlanStepType[] = ['source_scope', 'basic_info_module', 'analysis_module', 'output_module'];
+    const result = [...steps];
+    for (const type of required) {
+      if (!result.some((step) => step.type === type)) {
+        const fallback = fallbackSteps.find((step) => step.type === type);
+        if (fallback) result.push(fallback);
+      }
+    }
+    return result.slice(0, 6);
   }
 
   private safePlanId(value: unknown, fallback: string): string {
@@ -425,54 +453,94 @@ export class OpenClawService {
     return text.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || fallback;
   }
 
+  private safePlanStepType(value: unknown, fallback?: ReportPlanStepType): ReportPlanStepType {
+    const allowed = new Set<ReportPlanStepType>([
+      'search_queries',
+      'source_scope',
+      'basic_info_module',
+      'analysis_module',
+      'output_module',
+    ]);
+    return typeof value === 'string' && allowed.has(value as ReportPlanStepType)
+      ? (value as ReportPlanStepType)
+      : fallback || 'analysis_module';
+  }
+
   private buildFallbackPlan(input: ReportPlanRequest): ReportPlanResponse {
     const topic = this.sanitizeText(input.topic || '未命名编报', 60);
     const reportType = this.sanitizeText(input.reportType || 'report', 40);
+    const keywords = this.extractPlanningKeywords(topic);
+    const primaryKeyword = this.buildPrimaryPlanningKeyword(topic, keywords);
+    const reportLabel = reportType === 'write-hb-k'
+      ? 'K报'
+      : reportType === 'write-hb-hb'
+        ? 'HB报'
+        : reportType === 'person-intelligence-report'
+          ? '人物报'
+          : reportType === 'risk-assessment-reports'
+            ? '风险报'
+            : '编报';
     return {
       title: `${topic}：编报规划`,
-      summary: '已根据主题生成基础检索方向和研判子任务，请选择需要纳入正式编报的方向。',
+      summary: `已围绕“${topic}”生成${reportLabel}检索词和研判子任务，请选择需要纳入正式编报的方向。`,
       searchQueries: [
-        `${topic} 最新进展`,
-        `${topic} 政策背景`,
-        `${topic} 风险影响`,
+        `${topic} 最新动态`,
+        `${topic} 政策背景 影响`,
+        `${primaryKeyword} 公开报道 研判`,
+        `${topic} 风险 对策`,
         `${topic} 各方立场`,
-        `${topic} 应对建议`,
       ],
       steps: [
         {
-          id: 'search-scope',
-          title: '检索方向',
-          description: '选择需要优先搜索和核验的信息范围。',
+          id: 'source-scope',
+          type: 'source_scope',
+          title: '信源范围',
+          description: `选择围绕“${topic}”需要优先检索、抽取和交叉核验的信源类型。`,
           allowMultiple: true,
           options: [
-            { id: 'background', label: '背景脉络', detail: '梳理事件起因、时间线和关键节点。', selected: true },
-            { id: 'latest', label: '最新动态', detail: '检索近期公开报道、政策变化和各方表态。', selected: true },
-            { id: 'stakeholders', label: '相关主体', detail: '识别国家、机构、企业、人物等核心相关方。', selected: false },
-            { id: 'data', label: '数据佐证', detail: '搜索可引用的数据、案例和公开文件。', selected: false },
+            { id: 'official-sources', label: '官方信源', detail: `优先核验“${topic}”相关政府部门、国际组织、监管机构、法院或议会文件。`, selected: true },
+            { id: 'major-media', label: '主流媒体', detail: `补充“${topic}”的一线报道、公开采访、事件进展和各方回应。`, selected: true },
+            { id: 'think-tank-research', label: '智库研究', detail: `检索“${topic}”相关智库、研究机构、行业报告和专家分析。`, selected: true },
+            { id: 'data-material', label: '数据材料', detail: `补充支撑“${topic}”判断的公开数据、统计口径、案例和图表来源。`, selected: false },
+          ],
+        },
+        {
+          id: 'basic-info-module',
+          type: 'basic_info_module',
+          title: '基本信息模块',
+          description: `选择“${topic}”在基本情况部分需要展开的事实模块。`,
+          allowMultiple: true,
+          options: [
+            { id: 'topic-timeline', label: `${primaryKeyword}时间线`, detail: `梳理“${topic}”的起因、关键节点、近期变化和后续触发点。`, selected: true },
+            { id: 'policy-source', label: `${primaryKeyword}政策源头`, detail: `检索与“${topic}”直接相关的官方文件、政策表态、监管口径和执行依据。`, selected: true },
+            { id: 'actor-network', label: `${primaryKeyword}相关方`, detail: `识别“${topic}”涉及的国家、机构、企业、行业、人物及其利益关系。`, selected: true },
+            { id: 'similar-cases', label: '相似案例', detail: `补充与“${topic}”可比照的历史案例、国际惯例和关联事件。`, selected: false },
           ],
         },
         {
           id: 'analysis-focus',
+          type: 'analysis_module',
           title: '研判重点',
-          description: '选择报告正文需要重点展开的分析角度。',
+          description: `选择“${topic}”在正文中需要重点展开的判断角度。`,
           allowMultiple: true,
           options: [
-            { id: 'risk', label: '风险识别', detail: '研判政治、经济、社会、舆情或安全风险。', selected: true },
-            { id: 'impact', label: '影响评估', detail: '分析对我方、地区或行业的潜在影响。', selected: true },
-            { id: 'trend', label: '趋势推演', detail: '给出短期和中期走向判断。', selected: false },
-            { id: 'gap', label: '信息缺口', detail: '标注尚需补充核验的信息。', selected: false },
+            { id: 'core-risk', label: `${primaryKeyword}风险识别`, detail: `研判“${topic}”可能带来的政治、经济、产业、安全、舆情或外溢风险。`, selected: true },
+            { id: 'china-impact', label: '涉我影响', detail: `分析“${topic}”对我方利益、企业、产业链、地区合作或政策空间的影响。`, selected: true },
+            { id: 'trend-scenario', label: `${primaryKeyword}趋势推演`, detail: `围绕“${topic}”设计短期、中期可能走向及关键变量。`, selected: true },
+            { id: 'uncertainty-gap', label: '待核验信息', detail: `标注“${topic}”中信源不足、口径冲突或需要继续跟踪的事实缺口。`, selected: false },
           ],
         },
         {
           id: 'output-tone',
+          type: 'output_module',
           title: '输出口径',
-          description: '选择最终编报的写作侧重和成果形式。',
+          description: `选择“${topic}”最终${reportLabel}的写作侧重和成果形式。`,
           allowMultiple: true,
           options: [
-            { id: 'structured', label: '结构化三段式', detail: '按基本情况、风险研判、对策建议组织。', selected: reportType.includes('write-hb') },
-            { id: 'briefing', label: '领导参阅口径', detail: '突出结论先行、简洁可读和建议可执行。', selected: true },
-            { id: 'evidence', label: '来源可追溯', detail: '强化来源编号、可信度和信息缺口说明。', selected: true },
-            { id: 'action', label: '处置建议', detail: '输出可落地的工作预案和后续跟踪方向。', selected: false },
+            { id: 'structured', label: `${reportLabel}结构`, detail: reportType.includes('write-hb') ? '按基本情况、涉我风险、对策建议组织，突出现场调研和决策参考。' : '按背景、风险、影响、建议组织，突出条理和可读性。', selected: true },
+            { id: 'briefing', label: '结论先行', detail: `围绕“${topic}”先给出核心判断，再展开事实依据和风险说明。`, selected: true },
+            { id: 'evidence', label: '来源可追溯', detail: `对“${topic}”相关事实保留来源机构、时间和可信度提示，避免堆砌网址。`, selected: true },
+            { id: 'action', label: '对策建议', detail: `提出针对“${topic}”的后续跟踪、风险防范和处置建议。`, selected: false },
           ],
         },
       ],
@@ -480,11 +548,7 @@ export class OpenClawService {
   }
 
   private isPlanRelevant(topic: string, plan: ReportPlanResponse): boolean {
-    const terms = String(topic)
-      .replace(/[^\p{L}\p{N}]+/gu, ' ')
-      .split(/\s+/)
-      .map((item) => item.trim())
-      .filter((item) => item.length >= 2);
+    const terms = this.extractPlanningKeywords(topic);
     if (terms.length === 0) return true;
 
     const haystack = [
@@ -498,7 +562,54 @@ export class OpenClawService {
       ]),
     ].join('\n');
 
-    return terms.some((term) => haystack.includes(term));
+    return terms.some((term) => haystack.includes(term)) || haystack.includes(String(topic).trim());
+  }
+
+  private extractPlanningKeywords(topic: string): string[] {
+    const text = this.sanitizeText(String(topic || ''), 80);
+    const stopWords = new Set([
+      '方面',
+      '情报',
+      '研判',
+      '报告',
+      '编报',
+      '关于',
+      '有关',
+      '情况',
+      '事件',
+      '影响',
+      '风险',
+      '最新',
+    ]);
+    const matches = text.match(/[\p{Script=Han}A-Za-z0-9]{2,}/gu) || [];
+    const terms = new Set<string>();
+
+    for (const match of matches) {
+      if (!stopWords.has(match)) terms.add(match);
+      const chineseParts = match.match(/[\p{Script=Han}]{2,}/gu) || [];
+      for (const part of chineseParts) {
+        if (part.length > 6) {
+          for (let index = 0; index <= part.length - 2; index += 2) {
+            const token = part.slice(index, Math.min(index + 4, part.length));
+            if (token.length >= 2 && !stopWords.has(token)) terms.add(token);
+          }
+        }
+      }
+    }
+
+    return Array.from(terms).slice(0, 8);
+  }
+
+  private buildPrimaryPlanningKeyword(topic: string, keywords: string[]): string {
+    const normalized = this
+      .sanitizeText(topic, 40)
+      .replace(/方面/g, '')
+      .replace(/情报|研判|报告|编报|情况|事件/g, '')
+      .replace(/的$/g, '')
+      .trim();
+    if (normalized.length >= 2 && normalized.length <= 14) return normalized;
+    const compact = keywords.find((keyword) => keyword.length >= 2 && keyword.length <= 10);
+    return compact || normalized.slice(0, 12) || topic.slice(0, 12);
   }
 
   private async searchPlanningSources(queries: string[]): Promise<string> {
