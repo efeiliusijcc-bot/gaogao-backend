@@ -404,11 +404,15 @@ export class OpenClawService {
     try {
       const jsonText = text.trim().replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
       const parsed = JSON.parse(jsonText) as Partial<ReportPlanResponse>;
+      const requiresReportSections = fallback.steps.some((step) => step.type === 'report_section');
       const steps = Array.isArray(parsed.steps)
         ? parsed.steps
             .map((step, stepIndex) => {
               const fallbackStep = fallback.steps[stepIndex];
-              const type = this.safePlanStepType((step as { type?: unknown } | undefined)?.type, fallbackStep?.type);
+              const type = this.safePlanStepType(
+                (step as { type?: unknown } | undefined)?.type,
+                requiresReportSections ? undefined : fallbackStep?.type,
+              );
               const sectionTitle = this.sanitizeText(String((step as { sectionTitle?: unknown } | undefined)?.sectionTitle || fallbackStep?.sectionTitle || ''), 40);
               const title = this.sanitizeText(String(step?.title || sectionTitle || fallbackStep?.title || `步骤 ${stepIndex + 1}`), 40);
               return {
@@ -448,7 +452,10 @@ export class OpenClawService {
   }
 
   private ensurePlanStepTypes(steps: ReportPlanResponse['steps'], fallbackSteps: ReportPlanResponse['steps']): ReportPlanResponse['steps'] {
-    const result = [...steps];
+    const requiresReportSections = fallbackSteps.some((step) => step.type === 'report_section');
+    const result = requiresReportSections
+      ? steps.filter((step) => step.type === 'source_scope' || step.type === 'report_section')
+      : [...steps];
     for (const fallback of fallbackSteps) {
       const exists = fallback.type === 'report_section'
         ? result.some((step) => step.type === 'report_section' && step.sectionKey === fallback.sectionKey)
