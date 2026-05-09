@@ -111,15 +111,18 @@ export class OpenClawService {
       '请为一个中文深度编报任务生成“规划搜索与子任务选择”方案。',
       '只输出严格 JSON，不要输出 Markdown，不要解释。',
       'JSON 字段必须是：title, summary, searchQueries, steps。',
-      'steps 每项字段：id, type, title, description, allowMultiple, options。',
+      'steps 每项字段：id, type, sectionKey, sectionTitle, title, description, allowMultiple, options。',
       'options 每项字段：id, label, detail, selected。',
       '要求：',
       '1. searchQueries 给出 4-6 个可用于公开信息检索的中文查询词。',
-      '2. steps 必须覆盖 source_scope、basic_info_module、analysis_module、output_module 四类；type 只能使用 search_queries、source_scope、basic_info_module、analysis_module、output_module。',
-      '3. 每步 3-5 个选项，允许多选，默认选中最重要的 2-3 个。',
-      '4. 选项要贴合报类和主题，不要泛泛而谈。',
-      '5. 不要包含 URL、密钥、环境变量或长正文。',
-      '6. source_scope 用于让用户选择信源范围；basic_info_module 用于选择基本信息正文模块；analysis_module 用于选择研判模块；output_module 用于选择最终输出口径。',
+      '2. steps 必须先给出一个 source_scope 步骤，然后按报类一级章节逐章给出 report_section 步骤；type 只能使用 source_scope 或 report_section。',
+      '3. K报必须有 3 个 report_section：一、基本情况；二、涉我风险；三、对策建议。',
+      '4. HB报必须有 6 个 report_section：一、事件概述；二、背景分析；三、各方立场与反应；四、涉我风险评估；五、趋势研判；六、对策建议。',
+      '5. 每个 report_section 的 sectionTitle 必须等于对应章节名，sectionKey 必须是稳定英文蛇形命名。',
+      '6. 每个章节根据主题生成 2-6 个具体编报方向，数量不要固定；允许多选，默认选中最重要方向。',
+      '7. source_scope 用于让用户选择信源范围，选项要贴合主题。',
+      '8. 选项要贴合报类、主题和所在章节，不要泛泛而谈。',
+      '9. 不要包含 URL、密钥、环境变量或长正文。',
       '',
       `报类：${input.reportType}`,
       `主题：${input.topic}`,
@@ -355,11 +358,11 @@ export class OpenClawService {
     const reportType = typeof input.payload.report_type === 'string' ? input.payload.report_type : 'K报或HB报';
     return [
       `6. write-hb 的 report_type 为 ${reportType}，必须按该报种对应大纲撰写，不要混用 K报 与 HB报 结构。`,
-      '7. known_context 如果是 JSON，必须先解析其 selectedSearchQueries、userProvidedSources、selectedModules、parameterValues、supplement；如果解析失败，再按普通文本上下文处理。',
+      '7. known_context 如果是 JSON，必须先解析其 selectedSearchQueries、userProvidedSources、selectedModules、parameterValues、supplement；selectedModules 可能按章节提供 sectionKey、sectionTitle、selectedDirections；如果解析失败，再按普通文本上下文处理。',
       '8. Research Phase：优先使用 web-research-firecrawl 进行前置研究。若用户提供 userProvidedSources 或 selectedSources，先围绕这些信源/机构/URL 抽取和核验；再围绕 selectedSearchQueries 做公开检索。推荐通过 exec 调用：python3 /home/node/.openclaw/workspace/report-agent/skills/web-research-firecrawl/scripts/research_cli.py brief --query "检索词" --max-sources 8 --instruction "围绕用户选中的编报模块提取证据、关键信息、待核验项"。',
       '9. Research Phase 输出必须形成内部素材：sources、evidence_cards、key_findings、verification_needed 和信息缺口；不要把完整网页正文、长 stdout/stderr 或研究草稿发送到对话。',
       '10. Firecrawl/Exa/Tavily triad 不可用时，允许回退到 write-hb 原 Tavily 调研流程：node /home/node/.openclaw/workspace/skills/tavily-search/scripts/search.mjs 和 extract.mjs，并在内部记录“Firecrawl 不可用，已回退”。',
-      '11. Write-HB Phase：只在 Research Phase 完成后，基于前置研究结果和用户 selectedModules，按 write-hb 的 K报/HB报大纲撰写完整成稿；不得把未选模块强行作为正文重点。',
+      '11. Write-HB Phase：只在 Research Phase 完成后，基于前置研究结果和用户 selectedModules，按 sectionTitle 对应的 K报/HB报一级章节逐章撰写；每章重点展开 selectedDirections，未选方向不得强行作为正文重点。',
       `12. 必须把完整成稿 Markdown 写入 ${OPENCLAW_CONTAINER_REPORT_DIR} 下的 .md 文件；不要只在对话中输出正文。`,
       `13. 静默执行：调研、检索、提取、规划、草稿、进度说明都不要发送到对话；不要输出“任务已启动”“正在检索”“获取了足够素材”等中间文本。`,
       `14. 最终对话只输出一行：REPORT_FILE: ${OPENCLAW_CONTAINER_REPORT_DIR}/实际文件名.md。除这一行外不要输出摘要、正文、来源表或其他说明。`,
@@ -403,21 +406,29 @@ export class OpenClawService {
       const parsed = JSON.parse(jsonText) as Partial<ReportPlanResponse>;
       const steps = Array.isArray(parsed.steps)
         ? parsed.steps
-            .map((step, stepIndex) => ({
-              id: this.safePlanId(step?.id, `step-${stepIndex + 1}`),
-              type: this.safePlanStepType((step as { type?: unknown } | undefined)?.type, fallback.steps[stepIndex]?.type),
-              title: this.sanitizeText(String(step?.title || fallback.steps[stepIndex]?.title || `步骤 ${stepIndex + 1}`), 40),
-              description: this.sanitizeText(String(step?.description || ''), 120),
-              allowMultiple: step?.allowMultiple !== false,
-              options: Array.isArray(step?.options)
-                ? step.options.slice(0, 6).map((option, optionIndex) => ({
-                    id: this.safePlanId(option?.id, `option-${optionIndex + 1}`),
-                    label: this.sanitizeText(String(option?.label || `选项 ${optionIndex + 1}`), 40),
-                    detail: this.sanitizeText(String(option?.detail || ''), 120),
-                    selected: typeof option?.selected === 'boolean' ? option.selected : optionIndex < 3,
-                  }))
-                : [],
-            }))
+            .map((step, stepIndex) => {
+              const fallbackStep = fallback.steps[stepIndex];
+              const type = this.safePlanStepType((step as { type?: unknown } | undefined)?.type, fallbackStep?.type);
+              const sectionTitle = this.sanitizeText(String((step as { sectionTitle?: unknown } | undefined)?.sectionTitle || fallbackStep?.sectionTitle || ''), 40);
+              const title = this.sanitizeText(String(step?.title || sectionTitle || fallbackStep?.title || `步骤 ${stepIndex + 1}`), 40);
+              return {
+                id: this.safePlanId(step?.id, `step-${stepIndex + 1}`),
+                type,
+                sectionKey: this.safePlanId((step as { sectionKey?: unknown } | undefined)?.sectionKey, fallbackStep?.sectionKey || `section-${stepIndex + 1}`),
+                sectionTitle: sectionTitle || undefined,
+                title,
+                description: this.sanitizeText(String(step?.description || fallbackStep?.description || ''), 160),
+                allowMultiple: step?.allowMultiple !== false,
+                options: Array.isArray(step?.options)
+                  ? step.options.map((option, optionIndex) => ({
+                      id: this.safePlanId(option?.id, `option-${optionIndex + 1}`),
+                      label: this.sanitizeText(String(option?.label || `选项 ${optionIndex + 1}`), 48),
+                      detail: this.sanitizeText(String(option?.detail || ''), 160),
+                      selected: typeof option?.selected === 'boolean' ? option.selected : optionIndex < 3,
+                    }))
+                  : [],
+              };
+            })
             .filter((step) => step.options.length > 0)
         : [];
 
@@ -437,15 +448,16 @@ export class OpenClawService {
   }
 
   private ensurePlanStepTypes(steps: ReportPlanResponse['steps'], fallbackSteps: ReportPlanResponse['steps']): ReportPlanResponse['steps'] {
-    const required: ReportPlanStepType[] = ['source_scope', 'basic_info_module', 'analysis_module', 'output_module'];
     const result = [...steps];
-    for (const type of required) {
-      if (!result.some((step) => step.type === type)) {
-        const fallback = fallbackSteps.find((step) => step.type === type);
-        if (fallback) result.push(fallback);
+    for (const fallback of fallbackSteps) {
+      const exists = fallback.type === 'report_section'
+        ? result.some((step) => step.type === 'report_section' && step.sectionKey === fallback.sectionKey)
+        : result.some((step) => step.type === fallback.type);
+      if (!exists) {
+        result.push(fallback);
       }
     }
-    return result.slice(0, 6);
+    return result;
   }
 
   private safePlanId(value: unknown, fallback: string): string {
@@ -460,6 +472,7 @@ export class OpenClawService {
       'basic_info_module',
       'analysis_module',
       'output_module',
+      'report_section',
     ]);
     return typeof value === 'string' && allowed.has(value as ReportPlanStepType)
       ? (value as ReportPlanStepType)
@@ -504,46 +517,95 @@ export class OpenClawService {
             { id: 'data-material', label: '数据材料', detail: `补充支撑“${topic}”判断的公开数据、统计口径、案例和图表来源。`, selected: false },
           ],
         },
-        {
-          id: 'basic-info-module',
-          type: 'basic_info_module',
-          title: '基本信息模块',
-          description: `选择“${topic}”在基本情况部分需要展开的事实模块。`,
-          allowMultiple: true,
-          options: [
-            { id: 'topic-timeline', label: `${primaryKeyword}时间线`, detail: `梳理“${topic}”的起因、关键节点、近期变化和后续触发点。`, selected: true },
-            { id: 'policy-source', label: `${primaryKeyword}政策源头`, detail: `检索与“${topic}”直接相关的官方文件、政策表态、监管口径和执行依据。`, selected: true },
-            { id: 'actor-network', label: `${primaryKeyword}相关方`, detail: `识别“${topic}”涉及的国家、机构、企业、行业、人物及其利益关系。`, selected: true },
-            { id: 'similar-cases', label: '相似案例', detail: `补充与“${topic}”可比照的历史案例、国际惯例和关联事件。`, selected: false },
-          ],
-        },
-        {
-          id: 'analysis-focus',
-          type: 'analysis_module',
-          title: '研判重点',
-          description: `选择“${topic}”在正文中需要重点展开的判断角度。`,
-          allowMultiple: true,
-          options: [
-            { id: 'core-risk', label: `${primaryKeyword}风险识别`, detail: `研判“${topic}”可能带来的政治、经济、产业、安全、舆情或外溢风险。`, selected: true },
-            { id: 'china-impact', label: '涉我影响', detail: `分析“${topic}”对我方利益、企业、产业链、地区合作或政策空间的影响。`, selected: true },
-            { id: 'trend-scenario', label: `${primaryKeyword}趋势推演`, detail: `围绕“${topic}”设计短期、中期可能走向及关键变量。`, selected: true },
-            { id: 'uncertainty-gap', label: '待核验信息', detail: `标注“${topic}”中信源不足、口径冲突或需要继续跟踪的事实缺口。`, selected: false },
-          ],
-        },
-        {
-          id: 'output-tone',
-          type: 'output_module',
-          title: '输出口径',
-          description: `选择“${topic}”最终${reportLabel}的写作侧重和成果形式。`,
-          allowMultiple: true,
-          options: [
-            { id: 'structured', label: `${reportLabel}结构`, detail: reportType.includes('write-hb') ? '按基本情况、涉我风险、对策建议组织，突出现场调研和决策参考。' : '按背景、风险、影响、建议组织，突出条理和可读性。', selected: true },
-            { id: 'briefing', label: '结论先行', detail: `围绕“${topic}”先给出核心判断，再展开事实依据和风险说明。`, selected: true },
-            { id: 'evidence', label: '来源可追溯', detail: `对“${topic}”相关事实保留来源机构、时间和可信度提示，避免堆砌网址。`, selected: true },
-            { id: 'action', label: '对策建议', detail: `提出针对“${topic}”的后续跟踪、风险防范和处置建议。`, selected: false },
-          ],
-        },
+        ...this.buildFallbackReportSectionSteps(reportType, topic, primaryKeyword),
       ],
+    };
+  }
+
+  private buildFallbackReportSectionSteps(reportType: string, topic: string, primaryKeyword: string): ReportPlanResponse['steps'] {
+    if (reportType === 'write-hb-hb') {
+      return [
+        this.reportSectionStep('hb-event-summary', 'event_summary', '一、事件概述', `确定“${topic}”事件概述部分需要交代的方向。`, [
+          ['core-facts', '核心事实', `提炼“${topic}”的时间、地点、主体、动作和当前状态。`, true],
+          ['key-timeline', '关键时间节点', `梳理“${topic}”从发生到最新进展的关键节点。`, true],
+          ['trigger-factor', '触发因素', `说明“${topic}”直接诱因、外部变量和突发背景。`, false],
+        ]),
+        this.reportSectionStep('hb-background-analysis', 'background_analysis', '二、背景分析', `确定“${topic}”背景分析部分需要展开的方向。`, [
+          ['historical-context', '历史脉络', `回溯“${topic}”相关历史演进、长期矛盾和既有机制。`, true],
+          ['policy-context', '政策制度背景', `梳理“${topic}”涉及的政策、法规、条约或监管框架。`, true],
+          ['interest-structure', '利益格局', `识别“${topic}”背后的利益关系、资源约束和战略诉求。`, false],
+        ]),
+        this.reportSectionStep('hb-positions-reactions', 'positions_reactions', '三、各方立场与反应', `确定“${topic}”各方立场与反应部分需要覆盖的方向。`, [
+          ['direct-parties', '直接当事方', `归纳“${topic}”直接相关方的官方表态、行动和政策意图。`, true],
+          ['major-powers', '主要外部力量', `分析主要国家、国际组织或区域力量对“${topic}”的反应。`, true],
+          ['public-opinion', '舆论与媒体反应', `研判“${topic}”在舆论场和媒体叙事中的传播态势。`, false],
+        ]),
+        this.reportSectionStep('hb-risk-assessment', 'risk_assessment', '四、涉我风险评估', `确定“${topic}”涉我风险评估部分需要研判的方向。`, [
+          ['direct-risk', '直接风险', `研判“${topic}”对我方安全、外交、产业或人员利益的直接影响。`, true],
+          ['spillover-risk', '外溢风险', `分析“${topic}”可能引发的区域、市场、供应链或舆情外溢。`, true],
+          ['risk-level', '风险等级', `给出“${topic}”短期和中期风险等级及判断依据。`, false],
+        ]),
+        this.reportSectionStep('hb-trend-forecast', 'trend_forecast', '五、趋势研判', `确定“${topic}”趋势研判部分需要推演的方向。`, [
+          ['short-term', '短期走势', `判断“${topic}”未来 1-3 个月可能演变和关键触发点。`, true],
+          ['medium-term', '中期演变', `推演“${topic}”未来 3-12 个月的主要情景和变量。`, true],
+          ['uncertainty', '不确定因素', `标注“${topic}”中需要持续跟踪的信息缺口和不确定性。`, false],
+        ]),
+        this.reportSectionStep('hb-countermeasures', 'countermeasures', '六、对策建议', `确定“${topic}”对策建议部分需要提出的方向。`, [
+          ['immediate-response', '立即措施', `提出针对“${topic}”一周内可执行的监测、沟通或防范措施。`, true],
+          ['medium-response', '中期措施', `提出针对“${topic}”1-3 个月的协调、评估和风险处置安排。`, true],
+          ['contingency-plan', '预案与提示', `设计“${topic}”恶化或突发变化时的预案和风险提示。`, false],
+        ]),
+      ];
+    }
+
+    if (reportType === 'write-hb-k') {
+      return [
+        this.reportSectionStep('k-basic-info', 'basic_info', '一、基本情况', `确定“${topic}”基本情况部分需要展开的方向。`, [
+          ['event-process', `${primaryKeyword}事件经过`, `按时间顺序梳理“${topic}”起因、经过、结果和最新状态。`, true],
+          ['positions', '各方态度', `归纳“${topic}”相关政要、部门、机构、专家和主要主体表态。`, true],
+          ['related-background', '相关情况', `补充“${topic}”关联事件、涉及范围、历史背景和相似案例。`, true],
+          ['policy-basis', '政策依据', `核验“${topic}”涉及的政策文件、法律依据、制度框架和执行口径。`, false],
+        ]),
+        this.reportSectionStep('k-risk-to-china', 'risk_to_china', '二、涉我风险', `确定“${topic}”涉我风险部分需要研判的方向。`, [
+          ['security-interest', '涉我安全利益', `分析“${topic}”对我方安全、外交、经济、产业链或人员机构的影响。`, true],
+          ['risk-path', '风险传导路径', `说明“${topic}”风险如何通过政策、市场、舆论、地区局势向我方传导。`, true],
+          ['risk-level', '风险等级判断', `判断“${topic}”短期、中长期风险等级和关键依据。`, true],
+          ['information-gap', '信息缺口', `列明“${topic}”仍需核验的事实、口径冲突和后续跟踪点。`, false],
+        ]),
+        this.reportSectionStep('k-countermeasures', 'countermeasures', '三、对策建议', `确定“${topic}”对策建议部分需要提出的方向。`, [
+          ['immediate-actions', '立即措施', `提出针对“${topic}”一周内可采取的风险防范、沟通和监测动作。`, true],
+          ['medium-actions', '中期措施', `提出针对“${topic}”1-3 个月的协调、研判、预警和处置建议。`, true],
+          ['long-term-actions', '长期措施', `提出针对“${topic}”6 个月以上的机制建设、产业或政策应对建议。`, false],
+          ['contingency-warning', '预案与风险提示', `设计“${topic}”突发升级、舆情反转或外溢扩散时的预案。`, true],
+        ]),
+      ];
+    }
+
+    return [
+      this.reportSectionStep('general-analysis', 'analysis', '研判内容', `选择“${topic}”需要纳入正文的分析方向。`, [
+        ['facts', '事实梳理', `梳理“${topic}”核心事实和关键节点。`, true],
+        ['risk', '风险识别', `研判“${topic}”主要风险和影响。`, true],
+        ['action', '对策建议', `提出“${topic}”后续建议和跟踪方向。`, true],
+      ]),
+    ];
+  }
+
+  private reportSectionStep(
+    id: string,
+    sectionKey: string,
+    sectionTitle: string,
+    description: string,
+    options: Array<[string, string, string, boolean]>,
+  ): ReportPlanResponse['steps'][number] {
+    return {
+      id,
+      type: 'report_section',
+      sectionKey,
+      sectionTitle,
+      title: sectionTitle,
+      description,
+      allowMultiple: true,
+      options: options.map(([optionId, label, detail, selected]) => ({ id: optionId, label, detail, selected })),
     };
   }
 
@@ -557,6 +619,8 @@ export class OpenClawService {
       ...(plan.searchQueries || []),
       ...(plan.steps || []).flatMap((step) => [
         step.title,
+        step.sectionTitle || '',
+        step.sectionKey || '',
         step.description,
         ...(step.options || []).flatMap((option) => [option.label, option.detail]),
       ]),

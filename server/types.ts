@@ -84,11 +84,14 @@ export type ReportPlanStepType =
   | 'source_scope'
   | 'basic_info_module'
   | 'analysis_module'
-  | 'output_module';
+  | 'output_module'
+  | 'report_section';
 
 export interface ReportPlanStep {
   id: string;
   type: ReportPlanStepType;
+  sectionKey?: string;
+  sectionTitle?: string;
   title: string;
   description: string;
   allowMultiple: boolean;
