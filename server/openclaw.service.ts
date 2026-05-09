@@ -453,9 +453,19 @@ export class OpenClawService {
 
   private ensurePlanStepTypes(steps: ReportPlanResponse['steps'], fallbackSteps: ReportPlanResponse['steps']): ReportPlanResponse['steps'] {
     const requiresReportSections = fallbackSteps.some((step) => step.type === 'report_section');
-    const result = requiresReportSections
-      ? steps.filter((step) => step.type === 'source_scope' || step.type === 'report_section')
-      : [...steps];
+    if (requiresReportSections) {
+      const sourceScope = steps.find((step) => step.type === 'source_scope') || fallbackSteps.find((step) => step.type === 'source_scope');
+      const result = sourceScope ? [sourceScope] : [];
+      for (const fallback of fallbackSteps.filter((step) => step.type === 'report_section')) {
+        const candidate = steps.find((step) =>
+          step.type === 'report_section' &&
+          (step.sectionKey === fallback.sectionKey || step.sectionTitle === fallback.sectionTitle || step.title === fallback.sectionTitle),
+        );
+        result.push(candidate ? { ...candidate, id: fallback.id, sectionKey: fallback.sectionKey, sectionTitle: fallback.sectionTitle, title: fallback.sectionTitle || candidate.title } : fallback);
+      }
+      return result;
+    }
+    const result = [...steps];
     for (const fallback of fallbackSteps) {
       const exists = fallback.type === 'report_section'
         ? result.some((step) => step.type === 'report_section' && step.sectionKey === fallback.sectionKey)
