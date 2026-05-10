@@ -359,9 +359,9 @@ export class OpenClawService {
     return [
       `6. write-hb 的 report_type 为 ${reportType}，必须按该报种对应大纲撰写，不要混用 K报 与 HB报 结构。`,
       '7. known_context 如果是 JSON，必须先解析其 selectedSearchQueries、userProvidedSources、selectedModules、parameterValues、supplement；selectedModules 可能按章节提供 sectionKey、sectionTitle、selectedDirections；如果解析失败，再按普通文本上下文处理。',
-      '8. Research Phase：优先使用 web-research-firecrawl 进行前置研究。若用户提供 userProvidedSources 或 selectedSources，先围绕这些信源/机构/URL 抽取和核验；再围绕 selectedSearchQueries 做公开检索。推荐通过 exec 调用：python3 /home/node/.openclaw/workspace/report-agent/skills/web-research-firecrawl/scripts/research_cli.py brief --query "检索词" --max-sources 8 --instruction "围绕用户选中的编报模块提取证据、关键信息、待核验项"。',
-      '9. Research Phase 输出必须形成内部素材：sources、evidence_cards、key_findings、verification_needed 和信息缺口；不要把完整网页正文、长 stdout/stderr 或研究草稿发送到对话。',
-      '10. Firecrawl/Exa/Tavily triad 不可用时，允许回退到 write-hb 原 Tavily 调研流程：node /home/node/.openclaw/workspace/skills/tavily-search/scripts/search.mjs 和 extract.mjs，并在内部记录“Firecrawl 不可用，已回退”。',
+      '8. Research Phase：必须先读取并调用 web-research-firecrawl 进行前置研究。若用户提供 userProvidedSources 或 selectedSources，先围绕这些信源/机构/URL 抽取和核验；再围绕 selectedSearchQueries 做公开检索。必须先尝试 exec：python3 /home/node/.openclaw/workspace/report-agent/skills/web-research-firecrawl/scripts/research_cli.py brief --query "检索词" --max-sources 8 --instruction "围绕用户选中的 sectionTitle/selectedDirections 提取证据卡、关键信息、待核验项；正文不输出 URL" --output /tmp/research_output.json。',
+      '9. Research Phase 输出必须形成内部素材：sources、evidence_cards、key_findings、verification_needed 和信息缺口；至少读取一次 /tmp/research_output.json 或等价研究输出后，才能进入 Write-HB Phase；不要把完整网页正文、长 stdout/stderr 或研究草稿发送到对话。',
+      '10. Firecrawl/Exa/Tavily triad 不可用时，才允许回退到 write-hb 原 Tavily 调研流程或 orchestrate.mjs，并必须在内部研究材料中记录 firecrawl_fallback_reason；禁止未尝试 web-research-firecrawl 就直接执行 write-hb/scripts/orchestrate.mjs 作为唯一研究入口。',
       '11. Write-HB Phase：只在 Research Phase 完成后，基于前置研究结果和用户 selectedModules，按 sectionTitle 对应的 K报/HB报一级章节逐章撰写；每章重点展开 selectedDirections，未选方向不得强行作为正文重点。',
       `12. 必须把完整成稿 Markdown 写入 ${OPENCLAW_CONTAINER_REPORT_DIR} 下的 .md 文件；不要只在对话中输出正文。`,
       `13. 静默执行：调研、检索、提取、规划、草稿、进度说明都不要发送到对话；不要输出“任务已启动”“正在检索”“获取了足够素材”等中间文本。`,
