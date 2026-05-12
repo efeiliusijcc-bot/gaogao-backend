@@ -106,7 +106,7 @@ export class OpenClawService {
 
   async planReport(input: ReportPlanRequest): Promise<ReportPlanResponse> {
     const fallback = this.buildFallbackPlan(input);
-    const searchFindings = await this.searchPlanningSources(fallback.searchQueries.slice(0, 3));
+    const searchFindings = await this.searchPlanningSources(fallback.searchQueries);
     const prompt = [
       '请为一个中文深度编报任务生成“规划搜索与子任务选择”方案。',
       '只输出严格 JSON，不要输出 Markdown，不要解释。',
@@ -120,9 +120,10 @@ export class OpenClawService {
       '4. HB报必须有 6 个 report_section：一、事件概述；二、背景分析；三、各方立场与反应；四、涉我风险评估；五、趋势研判；六、对策建议。',
       '5. 每个 report_section 的 sectionTitle 必须等于对应章节名，sectionKey 必须是稳定英文蛇形命名。',
       '6. 每个章节根据主题生成 2-6 个具体编报方向，数量不要固定；允许多选，默认选中最重要方向。',
-      '7. source_scope 用于让用户选择信源范围，选项要贴合主题。',
-      '8. 选项要贴合报类、主题和所在章节，不要泛泛而谈。',
-      '9. 不要包含 URL、密钥、环境变量或长正文。',
+      '7. source_scope 用于让用户选择信源范围和具体可用信源。必须优先根据“初步公开检索摘要”把搜到的具体信源、机构、媒体、报告或数据库尽可能全部列为 options；不要只给少数通用类别。',
+      '8. source_scope options 不设固定数量上限；如检索到很多信源，去重后尽量全部展示。可补充官方/监管、主流媒体、智库研究、行业/数据材料、当事方/机构、区域/外文信源等兜底项。',
+      '9. 选项要贴合报类、主题和所在章节，不要泛泛而谈；每个 source_scope option 的 label 应是具体信源名或明确来源类型，detail 说明该信源可提供什么材料。',
+      '10. 不要包含 URL、密钥、环境变量或长正文。',
       '',
       `报类：${input.reportType}`,
       `主题：${input.topic}`,
@@ -531,7 +532,15 @@ export class OpenClawService {
             { id: 'official-sources', label: '官方信源', detail: `优先核验“${topic}”相关政府部门、国际组织、监管机构、法院或议会文件。`, selected: true },
             { id: 'major-media', label: '主流媒体', detail: `补充“${topic}”的一线报道、公开采访、事件进展和各方回应。`, selected: true },
             { id: 'think-tank-research', label: '智库研究', detail: `检索“${topic}”相关智库、研究机构、行业报告和专家分析。`, selected: true },
-            { id: 'data-material', label: '数据材料', detail: `补充支撑“${topic}”判断的公开数据、统计口径、案例和图表来源。`, selected: false },
+            { id: 'industry-data', label: '行业与数据材料', detail: `补充支撑“${topic}”判断的行业报告、公开数据、统计口径、案例和图表来源。`, selected: true },
+            { id: 'direct-parties', label: '当事方与相关机构', detail: `优先提取“${topic}”直接相关主体、企业、机构、协会或组织发布的声明、公告和行动信息。`, selected: false },
+            { id: 'regional-sources', label: '区域与当地信源', detail: `检索“${topic}”发生地或重点影响区域的当地媒体、地方政府、区域组织和本地分析。`, selected: false },
+            { id: 'foreign-language-sources', label: '外文信源', detail: `补充“${topic}”相关英文或其他外文公开信源，用于交叉核验中文信息和获取原始口径。`, selected: false },
+            { id: 'social-public-opinion', label: '舆情与公开讨论', detail: `观察“${topic}”在公开舆论场、社交平台、专家评论和媒体转载中的传播重点与争议点。`, selected: false },
+            { id: 'primary-documents', label: '原始文件与公告', detail: `优先检索“${topic}”相关原始公告、白皮书、法案文本、制裁清单、企业公告或会议纪要。`, selected: false },
+            { id: 'expert-commentary', label: '专家评论与访谈', detail: `补充“${topic}”相关专家访谈、公开评论、研讨会发言和专业解读。`, selected: false },
+            { id: 'historical-cases', label: '历史案例与相似事件', detail: `检索“${topic}”相关历史案例、类似事件和可比处置经验。`, selected: false },
+            { id: 'market-industry-reaction', label: '市场与行业反应', detail: `跟踪“${topic}”在资本市场、产业链、贸易流向、企业经营和行业组织中的反应。`, selected: false },
           ],
         },
         ...this.buildFallbackReportSectionSteps(reportType, topic, primaryKeyword),
@@ -709,7 +718,7 @@ export class OpenClawService {
             api_key: TAVILY_API_KEY,
             query,
             search_depth: 'basic',
-            max_results: 3,
+            max_results: 10,
             include_answer: true,
           }),
         });
@@ -717,24 +726,29 @@ export class OpenClawService {
         if (!response.ok) continue;
         const data = (await response.json()) as {
           answer?: unknown;
-          results?: Array<{ title?: unknown; content?: unknown }>;
+          results?: Array<{ title?: unknown; content?: unknown; url?: unknown; source?: unknown }>;
         };
         const lines = [
           typeof data.answer === 'string' ? data.answer : '',
           ...(Array.isArray(data.results)
-            ? data.results.map((item) => `${String(item.title || '')} ${String(item.content || '')}`)
+            ? data.results.map((item) => {
+                const source = String(item.source || item.title || '').trim();
+                const title = String(item.title || '').trim();
+                const content = String(item.content || '').trim();
+                return [source, title && title !== source ? title : '', content].filter(Boolean).join(' ');
+              })
             : []),
         ]
           .map((item) => this.sanitizeText(item, 180))
           .filter(Boolean)
-          .slice(0, 3);
+          .filter((item, index, array) => array.indexOf(item) === index);
         if (lines.length) findings.push(`查询：${query}\n${lines.map((line) => `- ${line}`).join('\n')}`);
       } catch {
         clearTimeout(timer);
       }
     }
 
-    return findings.join('\n\n').slice(0, 2400);
+    return findings.join('\n\n').slice(0, 8000);
   }
 
   private forwardGatewayEvent(
