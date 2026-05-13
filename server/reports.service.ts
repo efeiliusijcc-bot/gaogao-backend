@@ -240,6 +240,9 @@ export class ReportsService {
 
       const resolvedReport = await this.resolveOpenClawReportFile(result.markdown, startedAtMs);
       const finalMarkdown = resolvedReport?.markdown ?? result.markdown;
+      if (!resolvedReport && /^\s*REPORT_FILE\s*:/im.test(finalMarkdown)) {
+        throw new Error('OpenClaw returned a REPORT_FILE pointer, but no valid Markdown report file was found.');
+      }
       this.assertUsableGeneratedMarkdown(finalMarkdown);
       job.status = 'succeeded';
       job.markdown = finalMarkdown;
@@ -545,6 +548,15 @@ export class ReportsService {
   private assertUsableGeneratedMarkdown(markdown: string): void {
     const text = String(markdown || '').trim();
     if (!text) throw new Error('OpenClaw report-agent returned empty report content.');
+    if (/[{｛]\s*(?:jobId|报告名|filename|fileName|actual file name|实际文件名)\s*[}｝]/i.test(text)) {
+      throw new Error('OpenClaw report-agent returned placeholder output instead of a report file.');
+    }
+    if (/REPORT_FILE\s*:\s*.+\.json\b/i.test(text) || /\/final\/summary\.json/i.test(text)) {
+      throw new Error('OpenClaw report-agent returned a JSON summary path instead of a Markdown report.');
+    }
+    if (/复制报告到|copy\s+report\s+to/i.test(text) && text.length < 2000) {
+      throw new Error('OpenClaw report-agent returned workflow instructions instead of a final report.');
+    }
     if (/^no response from openclaw\.?$/i.test(text)) {
       throw new Error('OpenClaw report-agent returned no response.');
     }
@@ -563,6 +575,9 @@ export class ReportsService {
     const text = markdown.trim();
     if (!text) return false;
     if (size < 2000) return false;
+    if (/[{｛]\s*(?:jobId|报告名|filename|fileName|actual file name|实际文件名)\s*[}｝]/i.test(text)) return false;
+    if (/REPORT_FILE\s*:\s*.+\.json\b/i.test(text) || /\/final\/summary\.json/i.test(text)) return false;
+    if (/复制报告到|copy\s+report\s+to/i.test(text) && text.length < 2000) return false;
     if (/^no response from openclaw\.?$/i.test(text)) return false;
     if (/agent couldn't generate a response/i.test(text)) return false;
     if (/please try again/i.test(text) && text.length < 1000) return false;

@@ -389,7 +389,7 @@ export class OpenClawService {
       '11. Write-HB Phase：只在 Research Phase 完成后，基于前置研究结果和用户 selectedModules，按 sectionTitle 对应的 K报/HB报一级章节逐章撰写；每章重点展开 selectedDirections，未选方向不得强行作为正文重点。',
       `12. 必须把完整成稿 Markdown 写入 ${OPENCLAW_CONTAINER_REPORT_DIR} 下的 .md 文件；不要只在对话中输出正文。`,
       `13. 静默执行：调研、检索、提取、规划、草稿、进度说明都不要发送到对话；不要输出“任务已启动”“正在检索”“获取了足够素材”等中间文本。`,
-      `14. 最终对话只输出一行：REPORT_FILE: ${OPENCLAW_CONTAINER_REPORT_DIR}/实际文件名.md。除这一行外不要输出摘要、正文、来源表或其他说明。`,
+      `14. 最终对话只输出一行：REPORT_FILE: ${OPENCLAW_CONTAINER_REPORT_DIR}/实际文件名.md。这里的“实际文件名”必须替换为真实已写入的 .md 文件名；严禁输出 {jobId}、{报告名}、{filename}、summary.json、plan.json、context.json 或复制/后处理说明。除这一行外不要输出摘要、正文、来源表或其他说明。`,
       '15. 最终保存的 Markdown 正文、标题、来源、文件名均不得包含 Unicode 替换字符 U+FFFD、连续替换字符、\\ufffd 或明显乱码；如素材中有乱码，必须改写为语义完整的中文句子后再保存。',
       '16. 正文段落不得出现 http:// 或 https:// 原始网址；正文引用只写来源机构、发布时间和参考资料编号，完整 URL 只放在文末参考资料部分。',
     ];
