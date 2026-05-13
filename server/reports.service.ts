@@ -239,8 +239,10 @@ export class ReportsService {
       }
 
       const resolvedReport = await this.resolveOpenClawReportFile(result.markdown, startedAtMs);
+      const finalMarkdown = resolvedReport?.markdown ?? result.markdown;
+      this.assertUsableGeneratedMarkdown(finalMarkdown);
       job.status = 'succeeded';
-      job.markdown = resolvedReport?.markdown ?? result.markdown;
+      job.markdown = finalMarkdown;
       job.artifacts = result.artifacts;
       job.resultPath = resolvedReport?.filePath ?? (await this.writeReportFile(job, job.markdown));
       job.updatedAt = new Date().toISOString();
@@ -540,12 +542,31 @@ export class ReportsService {
     }
   }
 
+  private assertUsableGeneratedMarkdown(markdown: string): void {
+    const text = String(markdown || '').trim();
+    if (!text) throw new Error('OpenClaw report-agent returned empty report content.');
+    if (/^no response from openclaw\.?$/i.test(text)) {
+      throw new Error('OpenClaw report-agent returned no response.');
+    }
+    if (/agent couldn't generate a response/i.test(text)) {
+      throw new Error("OpenClaw report-agent couldn't generate a response.");
+    }
+    if (/quota exhausted|429\s+quota|500\s+internal|internal error/i.test(text) && text.length < 2000) {
+      throw new Error(text.slice(0, 300));
+    }
+    if (text.length < 1000 && !/REPORT_FILE:\s*\/.+\.md/i.test(text)) {
+      throw new Error('OpenClaw report-agent returned too little report content.');
+    }
+  }
+
   private isValidReportMarkdown(markdown: string, size: number): boolean {
     const text = markdown.trim();
     if (!text) return false;
     if (size < 2000) return false;
+    if (/^no response from openclaw\.?$/i.test(text)) return false;
     if (/agent couldn't generate a response/i.test(text)) return false;
     if (/please try again/i.test(text) && text.length < 1000) return false;
+    if (/quota exhausted|429\s+quota|500\s+internal|internal error/i.test(text) && text.length < 2000) return false;
     if (/报告已生成并保存/.test(text) && size < 5000) return false;
     return true;
   }

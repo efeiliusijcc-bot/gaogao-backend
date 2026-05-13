@@ -27,6 +27,9 @@ export class OpenClawApprovalRequiredError extends Error {
   }
 }
 
+const PLAN_MODEL_TIMEOUT_MS = Number(process.env.REPORT_PLAN_TIMEOUT_MS || 25000);
+const PLAN_SEARCH_QUERY_TIMEOUT_MS = Number(process.env.REPORT_PLAN_SEARCH_QUERY_TIMEOUT_MS || 2500);
+
 @Injectable()
 export class OpenClawService {
   constructor(private readonly gatewayDevice: OpenClawGatewayDeviceService) {}
@@ -133,22 +136,42 @@ export class OpenClawService {
     ].join('\n');
 
     try {
-      const completion = await this.client.chat.completions.create({
-        model: OPENCLAW_MODEL,
-        stream: false,
-        messages: [
-          {
-            role: 'system',
-            content: 'You are a precise report planning assistant. Return compact valid JSON only.',
-          },
-          { role: 'user', content: prompt },
-        ],
-      });
+      const completion = await this.withTimeout(
+        this.client.chat.completions.create({
+          model: OPENCLAW_MODEL,
+          stream: false,
+          messages: [
+            {
+              role: 'system',
+              content: 'You are a precise report planning assistant. Return compact valid JSON only.',
+            },
+            { role: 'user', content: prompt },
+          ],
+        }),
+        PLAN_MODEL_TIMEOUT_MS,
+        'Report planning timed out.',
+      );
       const plan = this.normalizePlanResponse(this.extractCompletionText(completion), fallback);
       return this.isPlanRelevant(input.topic, plan) ? plan : fallback;
     } catch {
       return fallback;
     }
+  }
+
+  private withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
   }
 
   private async runReportSegmented(input: RunInput, basePrompt: string): Promise<RunResult> {
@@ -240,7 +263,7 @@ export class OpenClawService {
       flushSessionEvents();
     }
 
-    const markdown = this.extractAgentMarkdown(agentPayload);
+    const markdown = this.extractAgentMarkdown(agentPayload) || this.extractSessionFinalText(sessionKey);
     if (!markdown) {
       throw new Error(`OpenClaw report-agent returned no text. Raw payload: ${JSON.stringify(agentPayload).slice(0, 2000)}`);
     }
@@ -704,11 +727,10 @@ export class OpenClawService {
 
   private async searchPlanningSources(queries: string[]): Promise<string> {
     if (!TAVILY_API_KEY || queries.length === 0) return '';
-    const findings: string[] = [];
-
-    for (const query of queries) {
+    const findings = await Promise.all(
+      queries.slice(0, 6).map(async (query) => {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 8000);
+      const timer = setTimeout(() => controller.abort(), PLAN_SEARCH_QUERY_TIMEOUT_MS);
       try {
         const response = await fetch('https://api.tavily.com/search', {
           method: 'POST',
@@ -723,7 +745,7 @@ export class OpenClawService {
           }),
         });
         clearTimeout(timer);
-        if (!response.ok) continue;
+        if (!response.ok) return '';
         const data = (await response.json()) as {
           answer?: unknown;
           results?: Array<{ title?: unknown; content?: unknown; url?: unknown; source?: unknown }>;
@@ -742,13 +764,15 @@ export class OpenClawService {
           .map((item) => this.sanitizeText(item, 180))
           .filter(Boolean)
           .filter((item, index, array) => array.indexOf(item) === index);
-        if (lines.length) findings.push(`查询：${query}\n${lines.map((line) => `- ${line}`).join('\n')}`);
+        return lines.length ? `查询：${query}\n${lines.map((line) => `- ${line}`).join('\n')}` : '';
       } catch {
         clearTimeout(timer);
+        return '';
       }
-    }
+    }),
+    );
 
-    return findings.join('\n\n').slice(0, 8000);
+    return findings.filter(Boolean).join('\n\n').slice(0, 8000);
   }
 
   private forwardGatewayEvent(
@@ -845,6 +869,54 @@ export class OpenClawService {
     } catch {
       return null;
     }
+  }
+
+  private extractSessionFinalText(sessionKey: string): string {
+    const jsonlPath = this.resolveSessionJsonlPath(sessionKey);
+    if (!jsonlPath) return '';
+
+    try {
+      const lines = fs.readFileSync(jsonlPath, 'utf8').split(/\r?\n/).filter(Boolean);
+      for (let index = lines.length - 1; index >= 0; index -= 1) {
+        const item = this.parseJsonLine(lines[index]);
+        const message = item?.message && typeof item.message === 'object' ? (item.message as Record<string, unknown>) : undefined;
+        if (!message || message.role !== 'assistant') continue;
+
+        const text = this.extractAssistantMessageText(message);
+        if (text) return text;
+      }
+
+      const fullText = lines.join('\n');
+      const reportPath = this.extractReportPathFromText(fullText);
+      return reportPath ? `REPORT_FILE: ${reportPath}` : '';
+    } catch {
+      return '';
+    }
+  }
+
+  private extractAssistantMessageText(message: Record<string, unknown>): string {
+    const direct = this.firstString(message, ['content', 'text', 'finalAssistantVisibleText', 'finalAssistantRawText']);
+    if (direct.trim()) return direct.trim();
+
+    const content = Array.isArray(message.content) ? message.content : [];
+    const texts = content
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (!item || typeof item !== 'object') return '';
+        const part = item as Record<string, unknown>;
+        if (part.type === 'toolCall') return '';
+        return this.firstString(part, ['text', 'content', 'value']);
+      })
+      .filter((text) => text.trim());
+
+    return texts.join('\n\n').trim();
+  }
+
+  private extractReportPathFromText(text: string): string {
+    const normalized = text.replaceAll('\\\\', '/');
+    const pattern = /(?:\/home\/node\/\.openclaw\/workspace\/report-agent\/reports\/|\/usr\/docker\/openclaw\/workspace\/report-agent\/reports\/)[^\r\n`"'<>|?*]+?\.md/gi;
+    const matches = Array.from(normalized.matchAll(pattern)).map((match) => match[0].trim());
+    return matches[matches.length - 1] || '';
   }
 
   private parseJsonLine(line: string): Record<string, unknown> | null {
@@ -1202,6 +1274,12 @@ export class OpenClawService {
 
   private extractTextError(text: string): string | null {
     const trimmed = text.trim();
+    if (!trimmed) return 'empty response';
+    if (/^no response from openclaw\.?$/i.test(trimmed)) return 'No response from OpenClaw.';
+    if (/agent couldn't generate a response/i.test(trimmed)) return "Agent couldn't generate a response.";
+    if (/quota exhausted|429\s+quota|internal error|500\s+internal|failed to fetch/i.test(trimmed) && trimmed.length < 1000) {
+      return trimmed.slice(0, 300);
+    }
     if (!trimmed.startsWith('{')) return null;
 
     try {
