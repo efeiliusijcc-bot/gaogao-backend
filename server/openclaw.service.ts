@@ -29,6 +29,7 @@ export class OpenClawApprovalRequiredError extends Error {
 
 const PLAN_MODEL_TIMEOUT_MS = Number(process.env.REPORT_PLAN_TIMEOUT_MS || 25000);
 const PLAN_SEARCH_QUERY_TIMEOUT_MS = Number(process.env.REPORT_PLAN_SEARCH_QUERY_TIMEOUT_MS || 2500);
+const GATEWAY_FINAL_POLL_INTERVAL_MS = 2000;
 
 @Injectable()
 export class OpenClawService {
@@ -245,7 +246,8 @@ export class OpenClawService {
       message: `Running OpenClaw report-agent through paired Gateway device (timeout ${Math.ceil(REPORT_TIMEOUT_MS / 1000)}s)...`,
     });
 
-    const pollTimer = setInterval(flushSessionEvents, 2000);
+    const startedAt = Date.now();
+    const pollTimer = setInterval(flushSessionEvents, GATEWAY_FINAL_POLL_INTERVAL_MS);
     pollTimer.unref?.();
 
     let agentPayload: unknown;
@@ -263,7 +265,8 @@ export class OpenClawService {
       flushSessionEvents();
     }
 
-    const markdown = this.extractAgentMarkdown(agentPayload) || this.extractSessionFinalText(sessionKey);
+    const initialMarkdown = this.extractAgentMarkdown(agentPayload) || this.extractSessionFinalText(sessionKey);
+    const markdown = await this.waitForGatewayFinalText(sessionKey, initialMarkdown, startedAt, input.onEvent, flushSessionEvents);
     if (!markdown) {
       throw new Error(`OpenClaw report-agent returned no text. Raw payload: ${JSON.stringify(agentPayload).slice(0, 2000)}`);
     }
@@ -273,6 +276,51 @@ export class OpenClawService {
 
     this.assertNoApprovalCommands(markdown);
     return { markdown, artifacts: {} };
+  }
+
+  private async waitForGatewayFinalText(
+    sessionKey: string,
+    initialMarkdown: string,
+    startedAt: number,
+    onEvent: (event: ServerEvent) => void,
+    flushSessionEvents: () => void,
+  ): Promise<string> {
+    const initial = initialMarkdown.trim();
+    if (this.isFinalReportText(initial)) return initial;
+
+    const deadline = startedAt + REPORT_TIMEOUT_MS;
+    let announced = false;
+    while (Date.now() < deadline) {
+      if (!announced) {
+        onEvent({
+          type: 'stage',
+          stage: 'waiting_final_report',
+          message: 'OpenClaw is still waiting for the final report file.',
+        });
+        announced = true;
+      }
+
+      await this.sleep(GATEWAY_FINAL_POLL_INTERVAL_MS);
+      flushSessionEvents();
+      const sessionText = this.extractSessionFinalText(sessionKey).trim();
+      if (this.isFinalReportText(sessionText)) return sessionText;
+    }
+
+    return initial;
+  }
+
+  private isFinalReportText(text: string): boolean {
+    const trimmed = text.trim();
+    if (!trimmed) return false;
+    if (/^HEARTBEAT_OK$/i.test(trimmed)) return false;
+    if (/^\[?Context:/i.test(trimmed)) return false;
+    if (/sessions_yield|等待.*Sub-Agent|等待.*完成/i.test(trimmed)) return false;
+    if (/REPORT_FILE\s*:\s*\/.+\.md\s*$/im.test(trimmed)) return true;
+    return trimmed.length >= 1000 && !/REPORT_FILE\s*:/i.test(trimmed);
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   async streamChat(
@@ -796,11 +844,14 @@ export class OpenClawService {
       const name = this.extractToolName(data);
       const summary = this.summarizeToolEvent(data);
       const raw = {
-        phase,
+        phase: summary.phase || phase,
+        toolPhase: phase,
         status: summary.status,
         label: summary.label,
         summary: summary.summary,
         command: summary.command,
+        actor: summary.actor,
+        detail: summary.detail,
       };
       if (summary.status === 'failed') onEvent({ type: 'tool_error', id, name, message: summary.summary, raw });
       else if (phase === 'start' || phase === 'call') onEvent({ type: 'tool_start', id, name, raw });
@@ -886,9 +937,7 @@ export class OpenClawService {
         if (text) return text;
       }
 
-      const fullText = lines.join('\n');
-      const reportPath = this.extractReportPathFromText(fullText);
-      return reportPath ? `REPORT_FILE: ${reportPath}` : '';
+      return '';
     } catch {
       return '';
     }
@@ -948,11 +997,14 @@ export class OpenClawService {
       id,
       name,
       raw: {
-        phase: 'call',
+        phase: summary.phase || 'call',
+        toolPhase: 'call',
         status: 'started',
         label: summary.label,
         summary: summary.summary,
         command: summary.command,
+        actor: summary.actor,
+        detail: summary.detail,
       },
     });
   }
@@ -972,11 +1024,14 @@ export class OpenClawService {
       id,
       name,
       raw: {
-        phase: 'output',
+        phase: summary.phase || 'output',
+        toolPhase: 'output',
         status: 'completed',
         label: summary.label,
         summary: summary.summary,
         command: '',
+        actor: summary.actor,
+        detail: summary.detail,
       },
     });
   }
@@ -1014,9 +1069,18 @@ export class OpenClawService {
     const command = this.sanitizeText(detail || this.extractCommand(data), 220);
     const output = this.extractOutputText(data);
     const status = this.detectToolStatus(data, phase, output);
-    const label = this.labelTool(name, command);
-    const summary = this.buildToolSummary(name, phase, status, command, output, detail);
-    return { status, label, command, summary };
+    const workflow = this.classifyReportWorkflowTool(name, phase, status, command, output, data);
+    const label = workflow?.label || this.labelTool(name, command);
+    const summary = workflow?.summary || this.buildToolSummary(name, phase, status, command, output, detail);
+    return {
+      status,
+      label,
+      command,
+      summary,
+      phase: workflow?.phase,
+      actor: workflow?.actor,
+      detail: workflow?.detail || detail,
+    };
   }
 
   private summarizeLifecycleEvent(phase: string, data: Record<string, unknown>): string {
@@ -1026,6 +1090,142 @@ export class OpenClawService {
     if (phase === 'complete' || phase === 'done') return 'OpenClaw completed the agent run.';
     if (phase === 'error') return 'OpenClaw reported an agent run error.';
     return `OpenClaw ${phase}`;
+  }
+
+  private classifyReportWorkflowTool(
+    name: string,
+    phase: string,
+    status: string,
+    command: string,
+    output: string,
+    data: Record<string, unknown>,
+  ): { phase: string; actor: string; label: string; summary: string; detail?: string } | null {
+    const args = this.extractToolArgs(data);
+    const sessionLabel = this.firstString(args, ['label', 'sessionLabel', 'name', 'sessionKey']);
+    const haystack = `${name} ${phase} ${command} ${output} ${sessionLabel}`.toLowerCase();
+    const completed = status === 'completed' ? '已完成' : status === 'failed' ? '失败' : '进行中';
+
+    if (/context\.json/.test(haystack)) {
+      return {
+        phase: 'context_preparing',
+        actor: 'main-agent',
+        label: '准备任务上下文',
+        summary: `编报任务上下文${completed}。`,
+        detail: command,
+      };
+    }
+
+    if (/harness_cli\.py\s+plan|\/plan\.json|\bplan\.json\b/.test(haystack)) {
+      return {
+        phase: 'research_planning',
+        actor: 'main-agent',
+        label: '生成调研计划',
+        summary: `调研计划${completed}。`,
+        detail: command,
+      };
+    }
+
+    if (/group_[a-z0-9_-]+\.json/.test(haystack)) {
+      return {
+        phase: 'research_dispatch',
+        actor: 'main-agent',
+        label: '生成调研分组',
+        summary: `调研分组${completed}。`,
+        detail: command,
+      };
+    }
+
+    if (/sessions_spawn/.test(haystack) && /research-group/.test(haystack)) {
+      return {
+        phase: 'research_dispatch',
+        actor: 'main-agent',
+        label: '启动调研子任务',
+        summary: `调研子任务 ${sessionLabel || 'research-group'} ${completed}。`,
+        detail: command,
+      };
+    }
+
+    if (/sessions_spawn/.test(haystack) && /synthesis/.test(haystack)) {
+      return {
+        phase: 'synthesis_dispatch',
+        actor: 'main-agent',
+        label: '启动撰稿子任务',
+        summary: `撰稿子任务${completed}。`,
+        detail: command,
+      };
+    }
+
+    if (/sessions_yield/.test(haystack) && /synthesis/.test(haystack)) {
+      return {
+        phase: 'synthesis_waiting',
+        actor: 'main-agent',
+        label: '等待撰稿完成',
+        summary: '正在等待撰稿子任务完成。',
+        detail: command,
+      };
+    }
+
+    if (/sessions_yield/.test(haystack)) {
+      return {
+        phase: 'research_waiting',
+        actor: 'main-agent',
+        label: '等待调研完成',
+        summary: '正在等待调研子任务完成。',
+        detail: command,
+      };
+    }
+
+    if (/final\/report\.md|report_file|\/reports\/[^ ]+\.md|\.md\b/.test(haystack) && /write|output|final|report_file|report\.md/.test(haystack)) {
+      return {
+        phase: 'report_saving',
+        actor: /synthesis/.test(haystack) ? 'synthesis-agent' : 'main-agent',
+        label: '保存报告文件',
+        summary: `报告文件${completed}。`,
+        detail: command,
+      };
+    }
+
+    if (/\b(grep|wc|ls|test|stat)\b/.test(haystack) && /report|\.md|final/.test(haystack)) {
+      return {
+        phase: 'report_verifying',
+        actor: 'main-agent',
+        label: '校验报告文件',
+        summary: `报告文件校验${completed}。`,
+        detail: command,
+      };
+    }
+
+    if (/harness_cli\.py\s+run|research_cli\.py|firecrawl|tavily|search\.mjs|extract\.mjs/.test(haystack)) {
+      return {
+        phase: 'research_collecting',
+        actor: /research-group/.test(haystack) ? 'research-agent' : 'main-agent',
+        label: '执行资料调研',
+        summary: `资料检索与提取${completed}。`,
+        detail: command,
+      };
+    }
+
+    if (/synthesis|synthesizer|analysis/.test(haystack)) {
+      return {
+        phase: 'synthesis_writing',
+        actor: 'synthesis-agent',
+        label: '整合并撰写报告',
+        summary: `报告撰写${completed}。`,
+        detail: command,
+      };
+    }
+
+    if (/skill\.md|\/skills\/|uuid|sessions\.json|read completed|command completed/.test(haystack)) {
+      return {
+        phase: 'technical_detail',
+        actor: 'main-agent',
+        label: '读取配置与中间信息',
+        summary: `技术准备步骤${completed}。`,
+        detail: command,
+      };
+    }
+
+    return null;
   }
 
   private detectToolStatus(data: Record<string, unknown>, phase: string, output: string): 'started' | 'completed' | 'failed' | 'running' {

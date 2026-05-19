@@ -26,6 +26,9 @@ export interface EventLogEntry {
   status: string;
   summary: string;
   command?: string;
+  phase?: string;
+  actor?: string;
+  detail?: string;
 }
 
 export type ServerEvent =

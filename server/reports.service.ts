@@ -226,6 +226,7 @@ export class ReportsService {
         onEvent: (event) => this.pushEvent(job, event),
       };
       let result;
+      let recoveredReport: Awaited<ReturnType<typeof this.resolveOpenClawReportFile>> = null;
       try {
         result = await this.openClaw.runReportViaGateway(runInput);
       } catch (gatewayError) {
@@ -235,10 +236,31 @@ export class ReportsService {
           stage: 'gateway_fallback',
           message: `OpenClaw Gateway event stream unavailable; falling back to non-streaming generation. ${message}`,
         });
-        result = await this.openClaw.runReport(runInput);
+        recoveredReport = await this.resolveOpenClawReportFile('', startedAtMs);
+        if (recoveredReport) {
+          this.pushEvent(job, {
+            type: 'stage',
+            stage: 'report_file_recovered',
+            message: `Recovered generated report file after empty Gateway response: ${recoveredReport.filePath}`,
+          });
+          result = { markdown: `REPORT_FILE: ${recoveredReport.filePath}`, artifacts: {} };
+        } else {
+          try {
+            result = await this.openClaw.runReport(runInput);
+          } catch (fallbackError) {
+            recoveredReport = await this.resolveOpenClawReportFile('', startedAtMs);
+            if (!recoveredReport) throw fallbackError;
+            this.pushEvent(job, {
+              type: 'stage',
+              stage: 'report_file_recovered',
+              message: `Recovered generated report file after empty fallback response: ${recoveredReport.filePath}`,
+            });
+            result = { markdown: `REPORT_FILE: ${recoveredReport.filePath}`, artifacts: {} };
+          }
+        }
       }
 
-      const resolvedReport = await this.resolveOpenClawReportFile(result.markdown, startedAtMs);
+      const resolvedReport = recoveredReport ?? (await this.resolveOpenClawReportFile(result.markdown, startedAtMs));
       const finalMarkdown = resolvedReport?.markdown ?? result.markdown;
       if (!resolvedReport && /^\s*REPORT_FILE\s*:/im.test(finalMarkdown)) {
         throw new Error('OpenClaw returned a REPORT_FILE pointer, but no valid Markdown report file was found.');
@@ -312,6 +334,8 @@ export class ReportsService {
         type: 'stage',
         label: '阶段进度',
         status: event.stage || 'running',
+        phase: event.stage,
+        actor: this.inferEventActor(event.stage),
         summary: this.sanitizeLogText(event.message || event.stage || 'OpenClaw 阶段更新', 220),
       };
     }
@@ -328,6 +352,9 @@ export class ReportsService {
         220,
       );
       const command = this.sanitizeCommandForEventLog(this.firstLogString(raw, ['command']));
+      const phase = this.sanitizeLogText(this.firstLogString(raw, ['phase']), 80);
+      const actor = this.sanitizeLogText(this.firstLogString(raw, ['actor']), 80);
+      const detail = this.sanitizeLogText(this.firstLogString(raw, ['detail']), 220);
       return {
         id: `${baseId}:${event.id ?? job.eventLog.length + 1}`,
         time: now,
@@ -336,6 +363,9 @@ export class ReportsService {
         status,
         summary,
         ...(command ? { command } : {}),
+        ...(phase ? { phase } : {}),
+        ...(actor ? { actor } : {}),
+        ...(detail ? { detail } : {}),
       };
     }
 
@@ -346,6 +376,8 @@ export class ReportsService {
         type: 'error',
         label: '任务错误',
         status: 'failed',
+        phase: 'error',
+        actor: 'system',
         summary: this.sanitizeLogText(event.message || '任务失败', 220),
       };
     }
@@ -357,6 +389,8 @@ export class ReportsService {
         type: 'done',
         label: '任务完成',
         status: 'completed',
+        phase: 'done',
+        actor: 'system',
         summary: '后端任务已结束。',
       };
     }
@@ -370,6 +404,13 @@ export class ReportsService {
       if (typeof candidate === 'string' && candidate.trim()) return candidate;
     }
     return '';
+  }
+
+  private inferEventActor(phase: string): string {
+    if (/research/i.test(phase)) return 'research-agent';
+    if (/synthesis/i.test(phase)) return 'synthesis-agent';
+    if (/openclaw|running|waiting_final_report/i.test(phase)) return 'main-agent';
+    return 'system';
   }
 
   private sanitizeCommandForEventLog(value: string): string {
