@@ -372,6 +372,7 @@ export class OpenClawService {
   private buildReportPrompt(input: RunInput): string {
     const payloadWithOutput = {
       ...input.payload,
+      ...this.buildContextJsonPayload(input),
       output_dir: OPENCLAW_CONTAINER_REPORT_DIR,
       output_file_instruction: `如果需要写入文件，请把最终 Markdown 报告保存到 ${OPENCLAW_CONTAINER_REPORT_DIR}。`,
     };
@@ -422,6 +423,83 @@ export class OpenClawService {
     }
 
     return `${key}: ${text}`;
+  }
+
+  private buildContextJsonPayload(input: RunInput): Record<string, unknown> {
+    if (input.skill !== 'write-hb') return {};
+
+    const knownContext = typeof input.payload.known_context === 'string' ? input.payload.known_context : '';
+    const parsedContext = this.parseJsonObject(knownContext);
+    const selectedModules = this.normalizeSelectedModules(parsedContext?.selectedModules);
+    const userProvidedSources = this.normalizeStringArray(
+      parsedContext?.userProvidedSources ?? parsedContext?.selectedSources,
+    );
+    const selectedSearchQueries = this.normalizeStringArray(parsedContext?.selectedSearchQueries);
+    const parameterValues =
+      parsedContext?.parameterValues && typeof parsedContext.parameterValues === 'object' && !Array.isArray(parsedContext.parameterValues)
+        ? parsedContext.parameterValues
+        : {};
+    const supplement = this.sanitizeText(
+      String(parsedContext?.supplement ?? (parsedContext ? '' : knownContext)),
+      3000,
+    );
+
+    const contextJson = {
+      schema_version: 1,
+      generated_by: 'backend',
+      skill: input.skill,
+      topic: String(input.payload.topic ?? ''),
+      report_type: String(input.payload.report_type ?? ''),
+      selectedSearchQueries,
+      userProvidedSources,
+      selectedModules,
+      parameterValues,
+      supplement,
+    };
+
+    return {
+      context_json: contextJson,
+      context_json_serialized: JSON.stringify(contextJson),
+      context_json_instruction:
+        'Before Research Phase, write a valid UTF-8 JSON file named context.json using context_json_serialized or exactly the context_json object. Use JSON.stringify/structured JSON serialization only; do not hand-write JSON, add comments, trailing commas, Markdown fences, or placeholder values.',
+    };
+  }
+
+  private parseJsonObject(text: string): Record<string, unknown> | null {
+    if (!text.trim()) return null;
+    try {
+      const parsed = JSON.parse(text) as unknown;
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private normalizeStringArray(value: unknown, limit = 20): string[] {
+    if (!Array.isArray(value)) return [];
+    return value
+      .map((item) => this.sanitizeText(String(item ?? ''), 300))
+      .filter(Boolean)
+      .slice(0, limit);
+  }
+
+  private normalizeSelectedModules(value: unknown): Array<{
+    sectionKey: string;
+    sectionTitle: string;
+    selectedDirections: string[];
+  }> {
+    if (!Array.isArray(value)) return [];
+    return value
+      .map((item) => {
+        const module = item && typeof item === 'object' ? (item as Record<string, unknown>) : {};
+        return {
+          sectionKey: this.sanitizeText(String(module.sectionKey ?? ''), 80),
+          sectionTitle: this.sanitizeText(String(module.sectionTitle ?? ''), 120),
+          selectedDirections: this.normalizeStringArray(module.selectedDirections, 12),
+        };
+      })
+      .filter((item) => item.sectionKey || item.sectionTitle || item.selectedDirections.length > 0)
+      .slice(0, 20);
   }
 
   private getSkillRequirements(input: RunInput): string[] {
