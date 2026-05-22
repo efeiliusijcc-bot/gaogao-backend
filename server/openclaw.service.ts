@@ -435,6 +435,7 @@ export class OpenClawService {
       parsedContext?.userProvidedSources ?? parsedContext?.selectedSources,
     );
     const selectedSearchQueries = this.normalizeStringArray(parsedContext?.selectedSearchQueries);
+    const databaseSourceOptions = this.normalizeDatabaseSourceOptions(parsedContext?.databaseSourceOptions);
     const parameterValues =
       parsedContext?.parameterValues && typeof parsedContext.parameterValues === 'object' && !Array.isArray(parsedContext.parameterValues)
         ? parsedContext.parameterValues
@@ -452,6 +453,7 @@ export class OpenClawService {
       report_type: String(input.payload.report_type ?? ''),
       selectedSearchQueries,
       userProvidedSources,
+      databaseSourceOptions,
       selectedModules,
       parameterValues,
       supplement,
@@ -483,6 +485,33 @@ export class OpenClawService {
       .slice(0, limit);
   }
 
+  private normalizeDatabaseSourceOptions(value: unknown): {
+    enabled: boolean;
+    mode: 'summary_first';
+    lookbackDays: number;
+    maxMetadataRows: number;
+    maxContentRows: number;
+    mcpServer: 'mysql-test';
+  } {
+    const options = value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+    const boundedInt = (raw: unknown, fallback: number, min: number, max: number) => {
+      const parsed = typeof raw === 'number' ? raw : Number(String(raw ?? ''));
+      if (!Number.isFinite(parsed)) return fallback;
+      return Math.max(min, Math.min(max, Math.floor(parsed)));
+    };
+
+    return {
+      enabled: options.enabled === true || String(options.enabled).toLowerCase() === 'true',
+      mode: 'summary_first',
+      lookbackDays: boundedInt(options.lookbackDays, 30, 1, 90),
+      maxMetadataRows: boundedInt(options.maxMetadataRows, 50, 1, 100),
+      maxContentRows: boundedInt(options.maxContentRows, 8, 0, 20),
+      mcpServer: 'mysql-test',
+    };
+  }
+
   private normalizeSelectedModules(value: unknown): Array<{
     sectionKey: string;
     sectionTitle: string;
@@ -506,10 +535,25 @@ export class OpenClawService {
     if (input.skill !== 'write-hb') return [];
 
     const reportType = typeof input.payload.report_type === 'string' ? input.payload.report_type : 'K报或HB报';
+    const knownContext = typeof input.payload.known_context === 'string' ? input.payload.known_context : '';
+    const parsedContext = this.parseJsonObject(knownContext);
+    const databaseSourceOptions = this.normalizeDatabaseSourceOptions(parsedContext?.databaseSourceOptions);
+    const databaseSourceRequirements = databaseSourceOptions.enabled
+      ? [
+          `18. databaseSourceOptions.enabled=true 时，Research Phase 必须在公开检索前调用 MCP 工具 mysql-test__mysql_query 检索数据库历史爬取信源；配置为 summary_first、lookbackDays=${databaseSourceOptions.lookbackDays}、maxMetadataRows=${databaseSourceOptions.maxMetadataRows}、maxContentRows=${databaseSourceOptions.maxContentRows}。`,
+          '19. 数据库检索必须只使用只读 SELECT；先查 DATABASE() 和 information_schema，找出近 30 天内命名为 data_YYYYMMDD 且包含 data_source_url、ch_title、entitle、summary、tag、designated_tag、publish_time、website_name 字段的表；不得执行 INSERT/UPDATE/DELETE/DDL。',
+          '20. 数据库首轮检索只允许读取 data_source_url、ch_title、entitle、summary、tag、designated_tag、publish_time、website_name；用主题、selectedSearchQueries、selectedModules.selectedDirections 生成中英及必要多语关键词，跨标题、摘要、标签检索；URL 去重并按相关性和发布时间排序。',
+          `21. 仅当表存在 content 字段时，才可对最多 ${databaseSourceOptions.maxContentRows} 条高相关记录读取 content 作为补充；严禁读取 raw_data 字段，任何 SQL 都不得包含 raw_data。`,
+          '22. 数据库命中结果必须形成内部 database_sources 证据卡，字段至少包含 url、title、summary、publish_time、website_name、tag、relevance_reason、needs_verification；与 web-research-firecrawl/Tavily 结果合并交叉核验后再写作。',
+          '23. 如果数据库 MCP 查询失败、无表、无命中、SQL 报错或权限不足，记录 database_source_fallback_reason 后继续执行 web-research-firecrawl 和公开检索，不得让编报任务失败。',
+        ]
+      : [
+          '18. databaseSourceOptions.enabled 不是 true 时，不得调用 mysql-test__mysql_query 或其他数据库 MCP 工具；继续使用 web-research-firecrawl、用户指定信源和公开检索。',
+        ];
     return [
       `6. write-hb 的 report_type 为 ${reportType}，必须按该报种对应大纲撰写，不要混用 K报 与 HB报 结构。`,
       '7. known_context 如果是 JSON，必须先解析其 selectedSearchQueries、userProvidedSources、selectedModules、parameterValues、supplement；selectedModules 可能按章节提供 sectionKey、sectionTitle、selectedDirections；如果解析失败，再按普通文本上下文处理。',
-      '8. Research Phase：必须先读取并调用 web-research-firecrawl 进行前置研究。若用户提供 userProvidedSources 或 selectedSources，先围绕这些信源/机构/URL 抽取和核验；再围绕 selectedSearchQueries 做公开检索。必须先尝试 exec：python3 /home/node/.openclaw/workspace/report-agent/skills/web-research-firecrawl/scripts/research_cli.py brief --query "检索词" --max-sources 8 --instruction "围绕用户选中的 sectionTitle/selectedDirections 提取证据卡、关键信息、待核验项；正文不输出 URL" --output /tmp/research_output.json。',
+      '8. Research Phase：如启用数据库信源，必须先完成 mysql-test__mysql_query 数据库检索，再读取并调用 web-research-firecrawl 进行前置研究。若用户提供 userProvidedSources 或 selectedSources，先围绕这些信源/机构/URL 抽取和核验；再围绕 selectedSearchQueries 做公开检索。必须先尝试 exec：python3 /home/node/.openclaw/workspace/report-agent/skills/web-research-firecrawl/scripts/research_cli.py brief --query "检索词" --max-sources 8 --instruction "围绕用户选中的 sectionTitle/selectedDirections 提取证据卡、关键信息、待核验项；正文不输出 URL" --output /tmp/research_output.json。',
       '9. Research Phase 输出必须形成内部素材：sources、evidence_cards、key_findings、verification_needed 和信息缺口；至少读取一次 /tmp/research_output.json 或等价研究输出后，才能进入 Write-HB Phase；不要把完整网页正文、长 stdout/stderr 或研究草稿发送到对话。',
       '10. Firecrawl/Exa/Tavily triad 不可用时，才允许回退到 write-hb 原 Tavily 调研流程或 orchestrate.mjs，并必须在内部研究材料中记录 firecrawl_fallback_reason；禁止未尝试 web-research-firecrawl 就直接执行 write-hb/scripts/orchestrate.mjs 作为唯一研究入口。',
       '11. Write-HB Phase：只在 Research Phase 完成后，基于前置研究结果和用户 selectedModules，按 sectionTitle 对应的 K报/HB报一级章节逐章撰写；每章重点展开 selectedDirections，未选方向不得强行作为正文重点。',
@@ -518,6 +562,8 @@ export class OpenClawService {
       `14. 最终对话只输出一行：REPORT_FILE: ${OPENCLAW_CONTAINER_REPORT_DIR}/实际文件名.md。这里的“实际文件名”必须替换为真实已写入的 .md 文件名；严禁输出 {jobId}、{报告名}、{filename}、summary.json、plan.json、context.json 或复制/后处理说明。除这一行外不要输出摘要、正文、来源表或其他说明。`,
       '15. 最终保存的 Markdown 正文、标题、来源、文件名均不得包含 Unicode 替换字符 U+FFFD、连续替换字符、\\ufffd 或明显乱码；如素材中有乱码，必须改写为语义完整的中文句子后再保存。',
       '16. 正文段落不得出现 http:// 或 https:// 原始网址；正文引用只写来源机构、发布时间和参考资料编号，完整 URL 只放在文末参考资料部分。',
+      '17. K报正文开头必须按标准样式把导语和摘要合并为“一、基本情况”之前的一整段自然段正文；不得生成“导语”“摘要”“导语/摘要”“摘要导语”等任何小标题，也不得拆成两个独立模块。',
+      ...databaseSourceRequirements,
     ];
   }
 
@@ -1143,7 +1189,7 @@ export class OpenClawService {
   private summarizeToolEvent(data: Record<string, unknown>) {
     const phase = typeof data.phase === 'string' ? data.phase : '';
     const name = this.extractToolName(data) || 'tool';
-    const detail = this.describeToolCall(name, data);
+    const detail = this.isDatabaseMcpTool(name) ? 'mysql-test__mysql_query read-only source lookup' : this.describeToolCall(name, data);
     const command = this.sanitizeText(detail || this.extractCommand(data), 220);
     const output = this.extractOutputText(data);
     const status = this.detectToolStatus(data, phase, output);
@@ -1182,6 +1228,16 @@ export class OpenClawService {
     const sessionLabel = this.firstString(args, ['label', 'sessionLabel', 'name', 'sessionKey']);
     const haystack = `${name} ${phase} ${command} ${output} ${sessionLabel}`.toLowerCase();
     const completed = status === 'completed' ? '已完成' : status === 'failed' ? '失败' : '进行中';
+
+    if (this.isDatabaseMcpTool(name) || /mysql-test__mysql_query|mysql_test__mysql_query|database_sources|database_source_fallback_reason/.test(haystack)) {
+      return {
+        phase: 'research_collecting',
+        actor: 'main-agent',
+        label: '数据库信源检索',
+        summary: `数据库历史爬取信源检索${completed}。`,
+        detail: 'mysql-test__mysql_query read-only source lookup',
+      };
+    }
 
     if (/context\.json/.test(haystack)) {
       return {
@@ -1317,6 +1373,12 @@ export class OpenClawService {
   }
 
   private buildToolSummary(name: string, phase: string, status: string, command: string, output: string, detail = ''): string {
+    if (this.isDatabaseMcpTool(name) || /mysql-test__mysql_query|mysql_test__mysql_query/i.test(command)) {
+      if (status === 'failed') return '数据库历史爬取信源检索失败，继续使用公开检索。';
+      if (status === 'started') return '正在检索数据库历史爬取信源。';
+      return '数据库历史爬取信源检索完成。';
+    }
+
     if (status === 'started') {
       if (detail) return detail;
       if (/search\.mjs/i.test(command)) return `Searching public sources${this.extractQuotedQuery(command)}.`;
@@ -1347,12 +1409,17 @@ export class OpenClawService {
   }
 
   private labelTool(name: string, command: string): string {
+    if (this.isDatabaseMcpTool(name) || /mysql-test__mysql_query|mysql_test__mysql_query/i.test(command)) return '数据库信源检索';
     if (/search\.mjs/i.test(command) || /tavily-search/i.test(name)) return 'Tavily Search';
     if (/extract\.mjs/i.test(command) || /tavily-extract/i.test(name)) return 'Tavily Extract';
     if (/write/i.test(name)) return 'Write';
     if (/read/i.test(name)) return 'Read';
     if (/exec/i.test(name)) return 'Exec';
     return name;
+  }
+
+  private isDatabaseMcpTool(name: string): boolean {
+    return /(?:^|[_-])mysql(?:[_-]|$)|mysql-test__mysql_query|mysql_query/i.test(name);
   }
 
   private describeToolCall(name: string, data: Record<string, unknown>): string {
