@@ -56,7 +56,7 @@ echo "--- 启动新容器 ---"
 docker run -d \
   --name gaogao-api \
   --network $SHARED_NET \
-  --restart unless-stopped \
+  --restart=unless-stopped \
   -p 1555:1555 \
   -e PORT=1555 \
   -e OPENCLAW_BASE_URL=http://openclaw:18789/v1 \
