@@ -35,18 +35,16 @@ ssh -i $SSH_KEY $REMOTE_USER@$REMOTE_HOST << REMOTE_SCRIPT
 set -e
 
 SRC_DIR=/usr/docker/gaogao-api/src
-SHARED_NET=openclaw-net
-
 cd $SRC_DIR
 
 echo "--- 构建镜像 ---"
 docker build -t gaogao-api:latest .
 
 echo "--- 创建共享网络 ---"
-docker network create $SHARED_NET 2>/dev/null || true
+docker network create openclaw-net 2>/dev/null || true
 
 echo "--- 加入 openclaw 到共享网络 ---"
-docker network connect $SHARED_NET openclaw 2>/dev/null || true
+docker network connect openclaw-net openclaw 2>/dev/null || true
 
 echo "--- 停止旧容器 ---"
 docker stop gaogao-api 2>/dev/null || true
@@ -55,7 +53,7 @@ docker rm gaogao-api 2>/dev/null || true
 echo "--- 启动新容器 ---"
 docker run -d \
   --name gaogao-api \
-  --network $SHARED_NET \
+  --network openclaw-net \
   --restart=unless-stopped \
   -p 1555:1555 \
   -e PORT=1555 \
