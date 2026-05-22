@@ -444,6 +444,12 @@ export class OpenClawService {
       String(parsedContext?.supplement ?? (parsedContext ? '' : knownContext)),
       3000,
     );
+    const databaseQueryIntent = this.buildDatabaseQueryIntent({
+      topic: String(input.payload.topic ?? ''),
+      selectedSearchQueries,
+      selectedModules,
+      supplement,
+    });
 
     const contextJson = {
       schema_version: 1,
@@ -454,6 +460,7 @@ export class OpenClawService {
       selectedSearchQueries,
       userProvidedSources,
       databaseSourceOptions,
+      databaseQueryIntent,
       selectedModules,
       parameterValues,
       supplement,
@@ -512,6 +519,148 @@ export class OpenClawService {
     };
   }
 
+  private buildDatabaseQueryIntent(input: {
+    topic: string;
+    selectedSearchQueries: string[];
+    selectedModules: Array<{
+      sectionKey: string;
+      sectionTitle: string;
+      selectedDirections: string[];
+    }>;
+    supplement: string;
+  }): Record<string, unknown> {
+    const rawTopic = this.sanitizeText(input.topic, 160);
+    const textParts = [
+      rawTopic,
+      ...input.selectedSearchQueries,
+      ...input.selectedModules.flatMap((module) => module.selectedDirections),
+      this.sanitizeText(input.supplement, 1000),
+    ].filter(Boolean);
+    const sourceText = textParts.join(' ');
+    const normalizedTopic = this.normalizeIntentText(rawTopic);
+    const combinedText = this.normalizeIntentText(sourceText);
+    const combinedTextLower = combinedText.toLowerCase();
+    const stopWords = new Set([
+      '报告',
+      '分析',
+      '影响',
+      '情况',
+      '最新',
+      '有关',
+      '关于',
+      '建议',
+      '对策',
+      '研判',
+      '编报',
+      '导语',
+      '摘要',
+      '资料',
+      '信息',
+      '方面',
+      '相关',
+      '研究',
+      '进行',
+      '开展',
+      '我国',
+      '我方',
+    ]);
+    const stopWordsRemoved = new Set<string>();
+    const primaryPhrases = new Set<string>();
+    const entityTerms = new Set<string>();
+    const actionTerms = new Set<string>();
+    const domainTerms = new Set<string>();
+    const ngrams = new Set<string>();
+
+    const addTerm = (target: Set<string>, raw: string, maxLength = 40): void => {
+      const term = this.normalizeIntentText(raw);
+      if (term.length < 2 || term.length > maxLength) return;
+      if (stopWords.has(term)) {
+        stopWordsRemoved.add(term);
+        return;
+      }
+      target.add(term);
+    };
+    const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const hasKnownTerm = (raw: string): boolean => {
+      const term = this.normalizeIntentText(raw);
+      if (/^[A-Za-z0-9]+$/.test(term)) return new RegExp(`\\b${escapeRegExp(term)}\\b`, 'i').test(combinedText);
+      return combinedTextLower.includes(term.toLowerCase());
+    };
+
+    addTerm(primaryPhrases, rawTopic, 80);
+    for (const query of input.selectedSearchQueries.slice(0, 8)) addTerm(primaryPhrases, query, 80);
+    for (const module of input.selectedModules.slice(0, 12)) {
+      for (const direction of module.selectedDirections.slice(0, 6)) addTerm(primaryPhrases, direction, 80);
+    }
+
+    const knownEntities = [
+      '美国', '中国', '欧盟', '俄罗斯', '日本', '韩国', '印度', '英国', '法国', '德国', '澳大利亚',
+      '加拿大', '东盟', '台湾', '香港', '新加坡', '乌克兰', '中东', '红海', '南海',
+      'USTR', 'OFAC', 'DOJ', 'FTC', 'SEC', 'FBI', 'CIA', 'CISA', 'EU', 'UN', 'NATO',
+      '商务部', '财政部', '司法部', '国会', '白宫', '海关', '港口', '海事局', '证监会',
+    ];
+    const actionLexicon = [
+      '制裁', '反制', '调查', '反垄断', '刑事执法', '执法升级', '升级', '打压', '限制',
+      '管制', '审查', '禁令', '加征', '征费', '征税', '诉讼', '罚款', '封锁', '脱钩',
+      '竞争', '收购', '并购', '出口管制', '进口限制', '供应链重组',
+    ];
+    const domainLexicon = [
+      '航运', '海事', '造船', '制造', '产业', '港口', '物流', '贸易', '关税', '供应链',
+      '芯片', '半导体', '技术', '人工智能', '金融', '能源', '军工', '汽车', '矿产',
+      '数据', '网络安全', '市场', '价格', '风险', '安全', '合规',
+    ];
+
+    for (const term of knownEntities) {
+      if (hasKnownTerm(term)) addTerm(entityTerms, term, 32);
+    }
+    for (const term of actionLexicon) {
+      if (hasKnownTerm(term)) addTerm(actionTerms, term, 32);
+    }
+    for (const term of domainLexicon) {
+      if (hasKnownTerm(term)) addTerm(domainTerms, term, 32);
+    }
+
+    for (const match of sourceText.match(/[A-Za-z][A-Za-z0-9&.+/-]{1,}/g) || []) {
+      addTerm(entityTerms, match, 32);
+    }
+    for (const match of sourceText.match(/\b(?:19|20)\d{2}\b/g) || []) {
+      addTerm(entityTerms, match, 8);
+    }
+    for (const match of sourceText.match(/[\p{Script=Han}]{2,}(?:公司|集团|委员会|部门|部|局|署|院|协会|联盟|机构|企业|银行|大学|研究所)/gu) || []) {
+      addTerm(entityTerms, match.replace(/^[和与对在由向从及、]+/, ''), 32);
+    }
+    for (const match of sourceText.match(/[\p{Script=Han}]{2,}/gu) || []) {
+      const normalized = this.normalizeIntentText(match);
+      for (const size of [4, 3, 2]) {
+        for (let index = 0; index <= normalized.length - size; index += 1) {
+          const token = normalized.slice(index, index + size);
+          addTerm(ngrams, token, 8);
+        }
+      }
+    }
+
+    for (const keyword of this.extractPlanningKeywords(rawTopic)) addTerm(ngrams, keyword, 16);
+
+    return {
+      rawTopic,
+      normalizedTopic,
+      primaryPhrases: Array.from(primaryPhrases).slice(0, 16),
+      entityTerms: Array.from(entityTerms).slice(0, 32),
+      actionTerms: Array.from(actionTerms).slice(0, 24),
+      domainTerms: Array.from(domainTerms).slice(0, 24),
+      ngrams: Array.from(ngrams).slice(0, 80),
+      stopWordsRemoved: Array.from(stopWordsRemoved).slice(0, 32),
+    };
+  }
+
+  private normalizeIntentText(value: string): string {
+    return this.sanitizeText(value.normalize('NFKC'), 120)
+      .replace(/[“”"‘’'`]+/g, '')
+      .replace(/[，。；、：:：！？!?（）()[\]{}<>《》【】|\\]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
   private normalizeSelectedModules(value: unknown): Array<{
     sectionKey: string;
     sectionTitle: string;
@@ -540,11 +689,11 @@ export class OpenClawService {
     const databaseSourceOptions = this.normalizeDatabaseSourceOptions(parsedContext?.databaseSourceOptions);
     const databaseSourceRequirements = databaseSourceOptions.enabled
       ? [
-          `18. databaseSourceOptions.enabled=true 时，Research Phase 必须在公开检索前调用 MCP 工具 mysql-test__mysql_query 检索数据库历史爬取信源；配置为 summary_first、lookbackDays=${databaseSourceOptions.lookbackDays}、maxMetadataRows=${databaseSourceOptions.maxMetadataRows}、maxContentRows=${databaseSourceOptions.maxContentRows}。`,
+          `18. databaseSourceOptions.enabled=true 时，Research Phase 必须先读取 context.json.databaseQueryIntent 分词词包，再在公开检索前调用 MCP 工具 mysql-test__mysql_query 检索数据库历史爬取信源；配置为 summary_first、lookbackDays=${databaseSourceOptions.lookbackDays}、maxMetadataRows=${databaseSourceOptions.maxMetadataRows}、maxContentRows=${databaseSourceOptions.maxContentRows}。`,
           '19. 数据库检索必须只使用只读 SELECT；先查 DATABASE() 和 information_schema，找出近 30 天内命名为 data_YYYYMMDD 且包含 data_source_url、ch_title、entitle、summary、tag、designated_tag、publish_time、website_name 字段的表；不得执行 INSERT/UPDATE/DELETE/DDL。',
-          '20. 数据库首轮检索只允许读取 data_source_url、ch_title、entitle、summary、tag、designated_tag、publish_time、website_name；用主题、selectedSearchQueries、selectedModules.selectedDirections 生成中英及必要多语关键词，跨标题、摘要、标签检索；URL 去重并按相关性和发布时间排序。',
+          '20. 数据库首轮检索只允许读取 data_source_url、ch_title、entitle、summary、tag、designated_tag、publish_time、website_name；优先使用 databaseQueryIntent.primaryPhrases、entityTerms、actionTerms、domainTerms、ngrams 组织检索条件，跨标题、摘要、标签检索；URL 去重并按完整主题短语、实体词、动作词、领域词、标题/标签/摘要命中和表日期/发布时间排序。',
           `21. 仅当表存在 content 字段时，才可对最多 ${databaseSourceOptions.maxContentRows} 条高相关记录读取 content 作为补充；严禁读取 raw_data 字段，任何 SQL 都不得包含 raw_data。`,
-          '22. 数据库命中结果必须形成内部 database_sources 证据卡，字段至少包含 url、title、summary、publish_time、website_name、tag、relevance_reason、needs_verification；与 web-research-firecrawl/Tavily 结果合并交叉核验后再写作。',
+          '22. 数据库命中结果必须形成内部 database_sources 证据卡和 database_query_plan，字段至少包含 url、title、summary、publish_time、website_name、tag、relevance_reason、needs_verification；database_query_plan 记录使用的词包、命中表、命中数量和回退原因；与 web-research-firecrawl/Tavily 结果合并交叉核验后再写作。',
           '23. 如果数据库 MCP 查询失败、无表、无命中、SQL 报错或权限不足，记录 database_source_fallback_reason 后继续执行 web-research-firecrawl 和公开检索，不得让编报任务失败。',
         ]
       : [
