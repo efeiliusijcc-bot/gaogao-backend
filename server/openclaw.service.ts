@@ -11,9 +11,9 @@ import {
   OPENCLAW_MODEL,
   OPENCLAW_STATE_DIR,
   REPORT_TIMEOUT_MS,
-  TAVILY_API_KEY,
 } from './config.js';
 import { OpenClawGatewayDeviceService } from './openclaw-gateway-device.service.js';
+import { ResearchKeysService } from './research-keys.service.js';
 import type { OpenClawHealth, ReportPlanRequest, ReportPlanResponse, RunInput, RunResult, ServerEvent } from './types.js';
 import type { ReportPlanStepType } from './types.js';
 
@@ -33,7 +33,10 @@ const GATEWAY_FINAL_POLL_INTERVAL_MS = 2000;
 
 @Injectable()
 export class OpenClawService {
-  constructor(private readonly gatewayDevice: OpenClawGatewayDeviceService) {}
+  constructor(
+    private readonly gatewayDevice: OpenClawGatewayDeviceService,
+    private readonly researchKeys: ResearchKeysService,
+  ) {}
 
   private readonly client = new OpenAI({
     apiKey: OPENCLAW_API_KEY,
@@ -712,6 +715,8 @@ export class OpenClawService {
       '15. 最终保存的 Markdown 正文、标题、来源、文件名均不得包含 Unicode 替换字符 U+FFFD、连续替换字符、\\ufffd 或明显乱码；如素材中有乱码，必须改写为语义完整的中文句子后再保存。',
       '16. 正文段落不得出现 http:// 或 https:// 原始网址；正文引用只写来源机构、发布时间和参考资料编号，完整 URL 只放在文末参考资料部分。',
       '17. K报正文开头必须按标准样式把导语和摘要合并为“一、基本情况”之前的一整段自然段正文；不得生成“导语”“摘要”“导语/摘要”“摘要导语”等任何小标题，也不得拆成两个独立模块。',
+      '18. K report format lock: use this exact structure, without relying on any historical file path: centered bold title; two separate metadata lines **编号：**K-YYYY-MMDD-NNN and **签发日期：**YYYY年M月D日; one untitled preface paragraph; ## **一、基本情况** with exactly four fixed subheadings ### **（一）主要内容**, ### **（二）各方态度**, ### **（三）相关情况**, ### **（四）其他背景**; ## **二、涉我风险** has no subheadings and uses bold Markdown leads **一是...。**, **二是...。**, **三是...。**, **四是...。**; ## **三、对策建议** has no subheadings and uses bold Markdown leads **一是...。**, **二是...。**, **三是...。**; ## **四、参考资料** is followed by **来源可信度评估：** paragraphs and **信息缺口：** numbered list.',
+      '19. selectedDirections only guide material coverage; never render selectedDirections labels such as 事件经过, 政策依据, 涉我安全利益, 风险传导路径, 风险等级判断, 立即措施, 中期措施, 预案与风险提示 as headings, subheadings, or fixed paragraph leads.',
       ...databaseSourceRequirements,
     ];
   }
@@ -1047,7 +1052,8 @@ export class OpenClawService {
   }
 
   private async searchPlanningSources(queries: string[]): Promise<string> {
-    if (!TAVILY_API_KEY || queries.length === 0) return '';
+    const tavilyApiKey = await this.researchKeys.getEffectiveKey('tavilyApiKey');
+    if (!tavilyApiKey || queries.length === 0) return '';
     const findings = await Promise.all(
       queries.slice(0, 6).map(async (query) => {
       const controller = new AbortController();
@@ -1058,7 +1064,7 @@ export class OpenClawService {
           headers: { 'Content-Type': 'application/json' },
           signal: controller.signal,
           body: JSON.stringify({
-            api_key: TAVILY_API_KEY,
+            api_key: tavilyApiKey,
             query,
             search_depth: 'basic',
             max_results: 10,
