@@ -50,6 +50,7 @@ export interface RunInput {
   payload: Record<string, unknown>;
   requestUser?: string;
   onEvent: (event: ServerEvent) => void;
+  jobId: string;
 }
 
 export interface RunResult {

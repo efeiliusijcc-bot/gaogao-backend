@@ -16,6 +16,22 @@ interface JobListOptions {
   q?: string;
 }
 
+interface DatabaseSourceItem {
+  title: string;
+  url: string;
+  summary: string;
+  websiteName: string;
+  publishTime: string;
+}
+
+interface DatabaseSourcesResponse {
+  status: 'hit' | 'empty' | 'fallback' | 'unavailable';
+  sources: DatabaseSourceItem[];
+  fallbackReason: string;
+  totalHits: number;
+  updatedAt: string | null;
+}
+
 @Injectable()
 export class ReportsService {
   private readonly jobs = new Map<string, JobRecord>();
@@ -211,6 +227,53 @@ export class ReportsService {
     return { markdown, artifacts: job.artifacts, resultPath: job.resultPath };
   }
 
+  async getDatabaseSources(jobId: string): Promise<DatabaseSourcesResponse | undefined> {
+    const job = this.jobs.get(jobId);
+    if (!job) return undefined;
+
+    const dir = await this.resolveOpenClawJobDir(job);
+    if (!dir) {
+      return { status: 'unavailable', sources: [], fallbackReason: '', totalHits: 0, updatedAt: null };
+    }
+
+    const planPath = this.remoteFs.joinPath(dir, 'database', 'database_query_plan.json');
+    const sourcesPath = this.remoteFs.joinPath(dir, 'database', 'database_sources.json');
+    const plan = await this.readJsonFile(planPath);
+    const planObject = plan && !Array.isArray(plan) ? plan : null;
+    const sourcesRaw = await this.readJsonFile(sourcesPath);
+    const sourcesList = Array.isArray(sourcesRaw) ? sourcesRaw : [];
+    const sources = this.normalizeDatabaseSources(sourcesList).slice(0, 50);
+    const fallbackReason = this.sanitizeLogText(
+      this.firstString(planObject, ['database_source_fallback_reason', 'fallbackReason', 'fallback_reason']),
+      300,
+    );
+
+    let updatedAt: string | null = null;
+    try {
+      const sourceStat = await this.remoteFs.stat(sourcesPath);
+      updatedAt = Number.isFinite(sourceStat.mtimeMs) ? new Date(sourceStat.mtimeMs).toISOString() : null;
+    } catch {
+      try {
+        const planStat = await this.remoteFs.stat(planPath);
+        updatedAt = Number.isFinite(planStat.mtimeMs) ? new Date(planStat.mtimeMs).toISOString() : null;
+      } catch {
+        updatedAt = null;
+      }
+    }
+
+    const planTotalHits = this.firstNumber(planObject, ['relevant_hits', 'total_hits', 'totalHits']) || 0;
+    const totalHits = Math.max(planTotalHits, sources.length);
+    const status: DatabaseSourcesResponse['status'] = sources.length
+      ? 'hit'
+      : fallbackReason
+        ? 'fallback'
+        : plan
+          ? 'empty'
+          : 'unavailable';
+
+    return { status, sources, fallbackReason, totalHits, updatedAt };
+  }
+
   private async runJob(job: JobRecord) {
     job.status = 'running';
     job.updatedAt = new Date().toISOString();
@@ -224,6 +287,7 @@ export class ReportsService {
         payload: job.payload as unknown as Record<string, unknown>,
         requestUser,
         onEvent: (event) => this.pushEvent(job, event),
+        jobId: job.jobId,
       };
       let result;
       let recoveredReport: Awaited<ReturnType<typeof this.resolveOpenClawReportFile>> = null;
@@ -406,6 +470,28 @@ export class ReportsService {
     return '';
   }
 
+  private firstString(data: Record<string, unknown> | null, keys: string[]): string {
+    if (!data) return '';
+    for (const key of keys) {
+      const value = data[key];
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return '';
+  }
+
+  private firstNumber(data: Record<string, unknown> | null, keys: string[]): number | undefined {
+    if (!data) return undefined;
+    for (const key of keys) {
+      const value = data[key];
+      if (typeof value === 'number' && Number.isFinite(value)) return value;
+      if (typeof value === 'string') {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed)) return parsed;
+      }
+    }
+    return undefined;
+  }
+
   private inferEventActor(phase: string): string {
     if (/research/i.test(phase)) return 'research-agent';
     if (/synthesis/i.test(phase)) return 'synthesis-agent';
@@ -584,6 +670,82 @@ export class ReportsService {
     } catch {
       return null;
     }
+  }
+
+  private async readJsonFile(filePath: string): Promise<Record<string, unknown> | unknown[] | null> {
+    try {
+      const raw = await this.remoteFs.readFile(filePath);
+      const parsed = JSON.parse(raw) as unknown;
+      if (!parsed || typeof parsed !== 'object') return null;
+      return parsed as Record<string, unknown> | unknown[];
+    } catch {
+      return null;
+    }
+  }
+
+  private normalizeDatabaseSources(items: unknown[]): DatabaseSourceItem[] {
+    const result: DatabaseSourceItem[] = [];
+    for (const item of items) {
+      if (!item || typeof item !== 'object') continue;
+      const source = item as Record<string, unknown>;
+      const title = this.sanitizeLogText(
+        this.firstString(source, ['ch_title', 'title', 'entitle']),
+        200,
+      );
+      const url = this.sanitizeLogText(
+        this.firstString(source, ['data_source_url', 'url']),
+        500,
+      );
+      if (!title && !url) continue;
+      result.push({
+        title,
+        url,
+        summary: this.sanitizeLogText(this.firstString(source, ['summary']), 1000),
+        websiteName: this.sanitizeLogText(this.firstString(source, ['website_name', 'websiteName']), 120),
+        publishTime: this.sanitizeLogText(this.firstString(source, ['publish_time', 'publishTime']), 60),
+      });
+    }
+    return result;
+  }
+
+  private async resolveOpenClawJobDir(job: JobRecord): Promise<string | null> {
+    const reportDir = this.remoteFs.remoteDir;
+    const entries = await this.remoteFs.readdir(reportDir);
+    const createdAtMs = new Date(job.createdAt).getTime();
+    const updatedAtMs = new Date(job.updatedAt || job.createdAt).getTime();
+    const candidates: Array<{ dir: string; score: number }> = [];
+
+    for (const entry of entries) {
+      if (!entry.isDirectory || !/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(entry.name)) continue;
+      const dir = this.remoteFs.joinPath(reportDir, entry.name);
+      const planPath = this.remoteFs.joinPath(dir, 'database', 'database_query_plan.json');
+      const sourcesPath = this.remoteFs.joinPath(dir, 'database', 'database_sources.json');
+      const hasPlan = await this.remoteFs.exists(planPath);
+      const hasSources = await this.remoteFs.exists(sourcesPath);
+      if (!hasPlan && !hasSources) continue;
+
+      const reportPath = this.remoteFs.joinPath(dir, 'final', 'report.md');
+      let mtimeMs = 0;
+      try {
+        mtimeMs = (await this.remoteFs.stat(reportPath)).mtimeMs;
+      } catch {
+        try {
+          mtimeMs = (await this.remoteFs.stat(hasSources ? sourcesPath : planPath)).mtimeMs;
+        } catch {
+          mtimeMs = 0;
+        }
+      }
+      if (!mtimeMs) continue;
+
+      const inWindow = mtimeMs >= createdAtMs - 15 * 60_000 && mtimeMs <= updatedAtMs + 15 * 60_000;
+      const proximity = Math.abs(mtimeMs - updatedAtMs);
+      const score = (inWindow ? 0 : 10_000_000_000) + proximity;
+      candidates.push({ dir, score });
+    }
+
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => a.score - b.score);
+    return candidates[0]?.dir ?? null;
   }
 
   private assertUsableGeneratedMarkdown(markdown: string): void {

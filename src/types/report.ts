@@ -93,6 +93,22 @@ export interface OpenClawHealth {
   details: string[];
 }
 
+export interface DatabaseSourceItem {
+  title: string;
+  url: string;
+  summary: string;
+  websiteName: string;
+  publishTime: string;
+}
+
+export interface DatabaseSourcesResponse {
+  status: 'hit' | 'empty' | 'fallback' | 'unavailable';
+  sources: DatabaseSourceItem[];
+  fallbackReason: string;
+  totalHits: number;
+  updatedAt: string | null;
+}
+
 export type SSEEvent =
   | { type: 'stage'; stage: string; message: string }
   | { type: 'status'; status: string; message?: string }

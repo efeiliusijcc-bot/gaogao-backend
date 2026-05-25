@@ -377,6 +377,123 @@ body {
 
 .placeholder { color: var(--text-muted); font-size: 14px; }
 
+/* Database sources card */
+.db-sources-card {
+  margin-top: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+
+.db-sources-card h3 {
+  font-size: 13px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  margin-bottom: 12px;
+}
+
+.db-sources-placeholder {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.db-sources-summary {
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.db-sources-time {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.db-sources-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 480px;
+  overflow-y: auto;
+}
+
+.db-source-item {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.db-source-item:last-child {
+  border-bottom: none;
+}
+
+.db-source-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  line-height: 1.4;
+}
+
+.db-source-title a {
+  color: var(--primary);
+  text-decoration: none;
+}
+
+.db-source-title a:hover {
+  text-decoration: underline;
+}
+
+.db-source-summary {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin: 0 0 6px;
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.db-source-meta {
+  display: flex;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.db-sources-toggle {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  padding: 6px 0;
+  border: none;
+  background: none;
+  color: var(--primary);
+  font-size: 12px;
+  cursor: pointer;
+  text-align: center;
+}
+
+.db-sources-toggle:hover {
+  text-decoration: underline;
+}
+
+.db-sources-fallback {
+  padding: 8px 0;
+}
+
+.db-sources-fallback p {
+  font-size: 13px;
+  color: var(--text);
+  margin: 0 0 4px;
+}
+
+.db-sources-reason {
+  color: var(--text-muted) !important;
+  font-size: 12px !important;
+}
+
 @media (max-width: 768px) {
   .skill-cards { grid-template-columns: 1fr; }
   .detail-grid { grid-template-columns: 1fr; }

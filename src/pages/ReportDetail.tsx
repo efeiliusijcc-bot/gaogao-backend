@@ -1,7 +1,115 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import DOMPurify from 'dompurify';
-import { fetchJobResult, getDownloadUrl, useJobPolling } from '../hooks/useApi';
+import { fetchDatabaseSources, fetchJobResult, getDownloadUrl, useJobPolling } from '../hooks/useApi';
+import type { DatabaseSourcesResponse } from '../types/report';
+
+function DatabaseSourcesCard({ jobId, jobStatus }: { jobId: string; jobStatus?: string }) {
+  const [data, setData] = useState<DatabaseSourcesResponse | null>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const result = await fetchDatabaseSources(jobId);
+      setData(result);
+    } catch {
+      setData(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [jobId]);
+
+  useEffect(() => {
+    void load();
+    if (jobStatus === 'queued' || jobStatus === 'running') {
+      const timer = setInterval(load, 8000);
+      return () => clearInterval(timer);
+    }
+  }, [load, jobStatus]);
+
+  const isRunning = jobStatus === 'queued' || jobStatus === 'running';
+  const showUnavailable = !data || data.status === 'unavailable';
+
+  if (loading && !data) {
+    return (
+      <div className="db-sources-card">
+        <h3>数据库信源检索</h3>
+        <p className="db-sources-placeholder">正在检查数据库信源...</p>
+      </div>
+    );
+  }
+
+  if (showUnavailable) {
+    return (
+      <div className="db-sources-card">
+        <h3>数据库信源检索</h3>
+        <p className="db-sources-placeholder">
+          {isRunning ? '数据库信源仍在检索或尚未落盘' : '数据库信源仍在检索或尚未落盘'}
+        </p>
+      </div>
+    );
+  }
+
+  const visibleSources = expanded ? data.sources : data.sources.slice(0, 8);
+  const hasMore = data.sources.length > 8;
+
+  return (
+    <div className="db-sources-card">
+      <h3>数据库信源检索</h3>
+
+      {data.status === 'hit' && (
+        <>
+          <div className="db-sources-summary">
+            数据库命中 <strong>{data.totalHits}</strong> 条信源
+            {data.updatedAt && (
+              <span className="db-sources-time">
+                {' '}| {new Date(data.updatedAt).toLocaleString('zh-CN')}
+              </span>
+            )}
+          </div>
+          <ul className="db-sources-list">
+            {visibleSources.map((source, i) => (
+              <li key={i} className="db-source-item">
+                <div className="db-source-title">
+                  {source.url ? (
+                    <a href={source.url} target="_blank" rel="noopener noreferrer">
+                      {source.title || source.url}
+                    </a>
+                  ) : (
+                    <span>{source.title || '(无标题)'}</span>
+                  )}
+                </div>
+                {source.summary && (
+                  <p className="db-source-summary">{source.summary}</p>
+                )}
+                <div className="db-source-meta">
+                  {source.websiteName && <span>{source.websiteName}</span>}
+                  {source.publishTime && <span>{source.publishTime}</span>}
+                </div>
+              </li>
+            ))}
+          </ul>
+          {hasMore && (
+            <button className="db-sources-toggle" onClick={() => setExpanded(!expanded)}>
+              {expanded ? '收起' : `查看更多 (共 ${data.sources.length} 条)`}
+            </button>
+          )}
+        </>
+      )}
+
+      {(data.status === 'empty' || data.status === 'fallback') && (
+        <div className="db-sources-fallback">
+          <p>数据库无直接命中，已回退公开检索</p>
+          {data.fallbackReason && (
+            <p className="db-sources-reason">原因：{data.fallbackReason}</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function ReportDetail() {
   const { jobId } = useParams<{ jobId: string }>();
@@ -66,6 +174,8 @@ export function ReportDetail() {
             {isRunning && <div className="log-entry running">后台正在生成，页面会自动轮询状态...</div>}
             {failedMessage && <div className="log-entry error">{failedMessage}</div>}
           </div>
+
+          {jobId && <DatabaseSourcesCard jobId={jobId} jobStatus={job?.status} />}
 
           {resultLoaded && jobId && (
             <div className="download-section">

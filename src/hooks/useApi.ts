@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import type {
   CreateJobRequest,
+  DatabaseSourcesResponse,
   OpenClawHealth,
   ReportJob,
   SSEEvent,
@@ -169,6 +170,12 @@ export function useJobPolling(jobId: string | null) {
 export async function fetchJobResult(jobId: string) {
   const res = await fetch(`${API_BASE}/report-jobs/${jobId}/result`);
   if (!res.ok) throw new Error('Failed to fetch result');
+  return res.json();
+}
+
+export async function fetchDatabaseSources(jobId: string): Promise<DatabaseSourcesResponse> {
+  const res = await fetch(`${API_BASE}/report-jobs/${jobId}/database-sources`);
+  if (!res.ok) throw new Error('Failed to fetch database sources');
   return res.json();
 }
 

@@ -457,6 +457,7 @@ export class OpenClawService {
     const contextJson = {
       schema_version: 1,
       generated_by: 'backend',
+      job_id: input.jobId,
       skill: input.skill,
       topic: String(input.payload.topic ?? ''),
       report_type: String(input.payload.report_type ?? ''),
@@ -686,6 +687,8 @@ export class OpenClawService {
   private getSkillRequirements(input: RunInput): string[] {
     if (input.skill !== 'write-hb') return [];
 
+    const jobId = input.jobId;
+    const jobIdShort = jobId.slice(0, 8);
     const reportType = typeof input.payload.report_type === 'string' ? input.payload.report_type : 'K报或HB报';
     const knownContext = typeof input.payload.known_context === 'string' ? input.payload.known_context : '';
     const parsedContext = this.parseJsonObject(knownContext);
@@ -696,8 +699,8 @@ export class OpenClawService {
           '19. 数据库检索必须只使用只读 SELECT；先查 DATABASE() 和 information_schema，找出近 30 天内命名为 data_YYYYMMDD 且包含 data_source_url、ch_title、entitle、summary、tag、designated_tag、publish_time、website_name 字段的表；不得执行 INSERT/UPDATE/DELETE/DDL。',
           '20. 数据库首轮检索只允许读取 data_source_url、ch_title、entitle、summary、tag、designated_tag、publish_time、website_name；优先使用 databaseQueryIntent.primaryPhrases、entityTerms、actionTerms、domainTerms、ngrams 组织检索条件，跨标题、摘要、标签检索；URL 去重并按完整主题短语、实体词、动作词、领域词、标题/标签/摘要命中和表日期/发布时间排序。',
           `21. 仅当表存在 content 字段时，才可对最多 ${databaseSourceOptions.maxContentRows} 条高相关记录读取 content 作为补充；严禁读取 raw_data 字段，任何 SQL 都不得包含 raw_data。`,
-          '22. 数据库命中结果必须单独保存为 database/database_sources.json 和 database/database_query_plan.json，并形成内部 database_sources 证据卡和 database_query_plan；字段至少包含 url、title、summary、publish_time、website_name、tag、relevance_reason、needs_verification；database_query_plan 记录使用的词包、命中表、命中数量和回退原因；数据库信源只能作为增量信源，与 Tavily/Exa/Firecrawl 三件套结果合并交叉核验后再写作。',
-          '23. 如果数据库 MCP 查询失败、无表、无命中、SQL 报错或权限不足，记录 database_source_fallback_reason 后继续执行 harness_cli.py plan/run、Tavily、Exa、Firecrawl 和公开检索，不得让编报任务失败，也不得因此缩减公网调研流程。',
+          '22. 数据库命中结果必须单独保存为 database/database_sources.json 和 database/database_query_plan.json。database_sources.json 每条记录必须保留原始展示字段：ch_title（中文标题）、data_source_url（信源链接）、summary（摘要）、website_name（来源站点名称）、publish_time（发布时间）；可附带内部字段如 tag、relevance_reason、needs_verification 等。database_query_plan 记录使用的词包、命中表、命中数量 total_hits/relevant_hits 和回退原因 database_source_fallback_reason。数据库信源只能作为增量信源，与 Tavily/Exa/Firecrawl 三件套结果合并交叉核验后再写作。',
+          '23. 如果数据库 MCP 查询失败、无表、无命中、SQL 报错或权限不足，必须在 database_query_plan.json 中写入 database_source_fallback_reason 字段（值为字符串，说明具体回退原因），然后继续执行 harness_cli.py plan/run、Tavily、Exa、Firecrawl 和公开检索，不得让编报任务失败，也不得因此缩减公网调研流程。',
         ]
       : [
           '18. databaseSourceOptions.enabled 不是 true 时，不得调用 mysql-test__mysql_query 或其他数据库 MCP 工具；继续使用 web-research-firecrawl、用户指定信源和公开检索。',
@@ -705,13 +708,13 @@ export class OpenClawService {
     return [
       `6. write-hb 的 report_type 为 ${reportType}，必须按该报种对应大纲撰写，不要混用 K报 与 HB报 结构。`,
       '7. known_context 如果是 JSON，必须先解析其 selectedSearchQueries、userProvidedSources、selectedModules、parameterValues、supplement；selectedModules 可能按章节提供 sectionKey、sectionTitle、selectedDirections；如果解析失败，再按普通文本上下文处理。',
-      '8. Research Phase 必须执行完整 K/HB 全量流水线：先写入 reports/{jobId}/context.json；如启用数据库信源，再完成 mysql-test__mysql_query 数据库预召回并保存 database/database_query_plan.json、database/database_sources.json；随后必须调用 /home/node/.openclaw/workspace/report-agent/skills/web-research-firecrawl/scripts/harness_cli.py plan 生成 plan.json 和 groups/group_A.json 等分组文件；再启动 research-{jobId_short}-{X} 调研子任务，由子任务调用 harness_cli.py run 产出 research/research_{X}.json；最后合并为 research/consolidated.json 后才能进入撰稿。',
+      `8. Research Phase 必须执行完整 K/HB 全量流水线：先写入 reports/${jobId}/context.json；如启用数据库信源，再完成 mysql-test__mysql_query 数据库预召回并保存 database/database_query_plan.json、database/database_sources.json；随后必须调用 /home/node/.openclaw/workspace/report-agent/skills/web-research-firecrawl/scripts/harness_cli.py plan 生成 plan.json 和 groups/group_A.json 等分组文件；再启动 research-${jobIdShort}-{X} 调研子任务，由子任务调用 harness_cli.py run 产出 research/research_{X}.json；最后合并为 research/consolidated.json 后才能进入撰稿。`,
       '9. Research Phase 禁止把 research_cli.py brief 作为 K/HB 主调研路径；research_cli.py brief 只允许在 harness_cli.py plan/run 已失败且已记录 firecrawl_fallback_reason 时作为异常补充。数据库信源不能替代 Tavily、Exa、Firecrawl 三件套，不能减少 harness_cli.py run、research_*.json 或 consolidated.json 的生成要求。',
       '10. Research Phase 输出必须形成完整内部素材包：context.json、plan.json、至少一个 groups/group_*.json、至少一个 research/research_*.json、research/consolidated.json、sources、evidence_cards、key_findings、verification_needed 和信息缺口；consolidated.json 或 research_*.json 中必须能看到 Tavily、Exa、Firecrawl 调研记录，除非三件套不可用且已记录明确 fallback reason。',
       '11. Write-HB Phase：只在 Research Phase 完成后，基于前置研究结果和用户 selectedModules，按 sectionTitle 对应的 K报/HB报一级章节逐章撰写；每章重点展开 selectedDirections，未选方向不得强行作为正文重点。',
       `12. 必须把完整成稿 Markdown 写入 ${OPENCLAW_CONTAINER_REPORT_DIR} 下的 .md 文件；不要只在对话中输出正文。`,
       `13. 静默执行：调研、检索、提取、规划、草稿、进度说明都不要发送到对话；不要输出“任务已启动”“正在检索”“获取了足够素材”等中间文本。`,
-      `14. 最终对话只输出一行：REPORT_FILE: ${OPENCLAW_CONTAINER_REPORT_DIR}/实际文件名.md。这里的“实际文件名”必须替换为真实已写入的 .md 文件名；严禁输出 {jobId}、{报告名}、{filename}、summary.json、plan.json、context.json 或复制/后处理说明。除这一行外不要输出摘要、正文、来源表或其他说明。`,
+      `14. 最终对话只输出一行：REPORT_FILE: ${OPENCLAW_CONTAINER_REPORT_DIR}/实际文件名.md。这里的”实际文件名”必须替换为真实已写入的 .md 文件名；严禁输出 ${jobId}、{报告名}、{filename}、summary.json、plan.json、context.json 或复制/后处理说明。除这一行外不要输出摘要、正文、来源表或其他说明。`,
       '15. 最终保存的 Markdown 正文、标题、来源、文件名均不得包含 Unicode 替换字符 U+FFFD、连续替换字符、\\ufffd 或明显乱码；如素材中有乱码，必须改写为语义完整的中文句子后再保存。',
       '16. 正文段落不得出现 http:// 或 https:// 原始网址；正文引用只写来源机构、发布时间和参考资料编号，完整 URL 只放在文末参考资料部分。',
       '17. K报正文开头必须按标准样式把导语和摘要合并为“一、基本情况”之前的一整段自然段正文；不得生成“导语”“摘要”“导语/摘要”“摘要导语”等任何小标题，也不得拆成两个独立模块。',

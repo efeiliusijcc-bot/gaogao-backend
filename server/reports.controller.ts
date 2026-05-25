@@ -105,6 +105,15 @@ export class ReportsController {
     return result;
   }
 
+  @Get(':jobId/database-sources')
+  async databaseSources(@Param('jobId') jobId: string) {
+    const result = await this.reports.getDatabaseSources(jobId);
+    if (result === undefined) {
+      throw new HttpException({ error: 'Job not found' }, HttpStatus.NOT_FOUND);
+    }
+    return result;
+  }
+
   @Get(':jobId/download')
   @Header('Content-Type', 'text/markdown; charset=utf-8')
   async download(@Param('jobId') jobId: string, @Query('format') format = 'md') {
