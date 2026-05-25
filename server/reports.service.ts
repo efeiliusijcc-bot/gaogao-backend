@@ -709,6 +709,9 @@ export class ReportsService {
   }
 
   private async resolveOpenClawJobDir(job: JobRecord): Promise<string | null> {
+    const fromKnownPath = await this.resolveOpenClawJobDirFromKnownPaths(job);
+    if (fromKnownPath) return fromKnownPath;
+
     const reportDir = this.remoteFs.remoteDir;
     const entries = await this.remoteFs.readdir(reportDir);
     const createdAtMs = new Date(job.createdAt).getTime();
@@ -746,6 +749,61 @@ export class ReportsService {
     if (!candidates.length) return null;
     candidates.sort((a, b) => a.score - b.score);
     return candidates[0]?.dir ?? null;
+  }
+
+  private async resolveOpenClawJobDirFromKnownPaths(job: JobRecord): Promise<string | null> {
+    const candidates = new Set<string>();
+    const addFromText = (value: unknown) => {
+      if (typeof value !== 'string' || !value.trim()) return;
+      for (const dir of this.extractOpenClawJobDirs(value)) candidates.add(dir);
+    };
+
+    addFromText(job.resultPath);
+    addFromText(job.markdown);
+    for (const entry of job.eventLog || []) {
+      addFromText(entry.summary);
+      addFromText(entry.command);
+      addFromText(entry.detail);
+    }
+    for (const event of job.events || []) addFromText(JSON.stringify(event));
+
+    for (const dir of candidates) {
+      if (await this.hasDatabaseSourceFiles(dir)) return dir;
+    }
+    return null;
+  }
+
+  private extractOpenClawJobDirs(text: string): string[] {
+    const dirs = new Set<string>();
+    const normalizedText = text.replace(/\\/g, '/');
+    const pathMatches = normalizedText.match(/(?:[A-Za-z]:\/|\/)[^\s"'<>，。；、)）\]]+/g) || [];
+    for (const rawPath of pathMatches) {
+      const candidate = rawPath.replace(/[.,;:]+$/g, '');
+      const dir = this.openClawJobDirFromPath(candidate);
+      if (dir) dirs.add(dir);
+    }
+    return Array.from(dirs);
+  }
+
+  private openClawJobDirFromPath(rawPath: string): string | null {
+    const filePath = rawPath.replace(/\\/g, '/');
+    const reportDir = this.remoteFs.remoteDir.replace(/\\/g, '/').replace(/\/+$/g, '');
+    const uuidSegment = '[0-9a-f]{8}-[0-9a-f-]{27}';
+    const nestedMatch = filePath.match(new RegExp(`^(.*/${uuidSegment})(?:/|$)`, 'i'));
+    if (nestedMatch?.[1]) return nestedMatch[1];
+
+    if (filePath.startsWith(`${reportDir}/`)) {
+      const relative = filePath.slice(reportDir.length + 1);
+      const firstSegment = relative.split('/')[0] || '';
+      if (new RegExp(`^${uuidSegment}$`, 'i').test(firstSegment)) return `${reportDir}/${firstSegment}`;
+    }
+    return null;
+  }
+
+  private async hasDatabaseSourceFiles(dir: string): Promise<boolean> {
+    const planPath = this.remoteFs.joinPath(dir, 'database', 'database_query_plan.json');
+    const sourcesPath = this.remoteFs.joinPath(dir, 'database', 'database_sources.json');
+    return (await this.remoteFs.exists(planPath)) || (await this.remoteFs.exists(sourcesPath));
   }
 
   private assertUsableGeneratedMarkdown(markdown: string): void {
