@@ -24,12 +24,23 @@ interface DatabaseSourceItem {
   publishTime: string;
 }
 
+interface DatabaseQueryPlanSummary {
+  tablesDiscovered: number;
+  tablesChecked: number;
+  strictHits: number;
+  expandedHits: number;
+  returnedSources: number;
+  broadeningApplied: boolean;
+  contentRowsRead: number;
+}
+
 interface DatabaseSourcesResponse {
   status: 'hit' | 'empty' | 'fallback' | 'unavailable';
   sources: DatabaseSourceItem[];
   fallbackReason: string;
   totalHits: number;
   updatedAt: string | null;
+  queryPlan: DatabaseQueryPlanSummary;
 }
 
 @Injectable()
@@ -233,7 +244,14 @@ export class ReportsService {
 
     const dir = await this.resolveOpenClawJobDir(job);
     if (!dir) {
-      return { status: 'unavailable', sources: [], fallbackReason: '', totalHits: 0, updatedAt: null };
+      return {
+        status: 'unavailable',
+        sources: [],
+        fallbackReason: '',
+        totalHits: 0,
+        updatedAt: null,
+        queryPlan: this.emptyDatabaseQueryPlanSummary(),
+      };
     }
 
     const planPath = this.remoteFs.joinPath(dir, 'database', 'database_query_plan.json');
@@ -243,6 +261,7 @@ export class ReportsService {
     const sourcesRaw = await this.readJsonFile(sourcesPath);
     const sourcesList = Array.isArray(sourcesRaw) ? sourcesRaw : [];
     const sources = this.normalizeDatabaseSources(sourcesList).slice(0, 50);
+    const queryPlan = this.buildDatabaseQueryPlanSummary(planObject, sources.length);
     const fallbackReason = this.sanitizeLogText(
       this.firstString(planObject, ['database_source_fallback_reason', 'fallbackReason', 'fallback_reason']),
       300,
@@ -261,7 +280,7 @@ export class ReportsService {
       }
     }
 
-    const planTotalHits = this.firstNumber(planObject, ['relevant_hits', 'total_hits', 'totalHits']) || 0;
+    const planTotalHits = this.firstNumber(planObject, ['total_hits', 'totalHits', 'relevant_hits']) || 0;
     const totalHits = Math.max(planTotalHits, sources.length);
     const status: DatabaseSourcesResponse['status'] = sources.length
       ? 'hit'
@@ -271,7 +290,7 @@ export class ReportsService {
           ? 'empty'
           : 'unavailable';
 
-    return { status, sources, fallbackReason, totalHits, updatedAt };
+    return { status, sources, fallbackReason, totalHits, updatedAt, queryPlan };
   }
 
   private async runJob(job: JobRecord) {
@@ -490,6 +509,70 @@ export class ReportsService {
       }
     }
     return undefined;
+  }
+
+  private firstBoolean(data: Record<string, unknown> | null, keys: string[]): boolean | undefined {
+    if (!data) return undefined;
+    for (const key of keys) {
+      const value = data[key];
+      if (typeof value === 'boolean') return value;
+      if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase();
+        if (normalized === 'true') return true;
+        if (normalized === 'false') return false;
+      }
+    }
+    return undefined;
+  }
+
+  private arrayLength(data: Record<string, unknown> | null, keys: string[]): number | undefined {
+    if (!data) return undefined;
+    for (const key of keys) {
+      const value = data[key];
+      if (Array.isArray(value)) return value.length;
+    }
+    return undefined;
+  }
+
+  private nonNegativeInt(value: number | undefined): number {
+    if (value === undefined || !Number.isFinite(value)) return 0;
+    return Math.max(0, Math.trunc(value));
+  }
+
+  private emptyDatabaseQueryPlanSummary(): DatabaseQueryPlanSummary {
+    return {
+      tablesDiscovered: 0,
+      tablesChecked: 0,
+      strictHits: 0,
+      expandedHits: 0,
+      returnedSources: 0,
+      broadeningApplied: false,
+      contentRowsRead: 0,
+    };
+  }
+
+  private buildDatabaseQueryPlanSummary(plan: Record<string, unknown> | null, sourceCount: number): DatabaseQueryPlanSummary {
+    const tablesDiscovered =
+      this.firstNumber(plan, ['tables_discovered_count', 'tablesDiscoveredCount', 'discovered_tables_count']) ??
+      this.arrayLength(plan, ['tables_discovered', 'tablesDiscovered', 'discovered_tables']);
+    const tablesChecked =
+      this.firstNumber(plan, ['tables_checked_count', 'tablesCheckedCount', 'checked_tables_count']) ??
+      this.arrayLength(plan, ['tables_checked', 'tablesChecked', 'checked_tables']);
+    const strictHits = this.firstNumber(plan, ['strict_hits', 'strictHits']);
+    const expandedHits = this.firstNumber(plan, ['expanded_hits', 'expandedHits']);
+    const returnedSources = this.firstNumber(plan, ['returned_sources', 'returnedSources']);
+    const broadeningApplied = this.firstBoolean(plan, ['broadening_applied', 'broadeningApplied']) ?? this.nonNegativeInt(expandedHits) > 0;
+    const contentRowsRead = this.firstNumber(plan, ['content_rows_read', 'contentRowsRead']);
+
+    return {
+      tablesDiscovered: this.nonNegativeInt(tablesDiscovered),
+      tablesChecked: this.nonNegativeInt(tablesChecked),
+      strictHits: this.nonNegativeInt(strictHits),
+      expandedHits: this.nonNegativeInt(expandedHits),
+      returnedSources: this.nonNegativeInt(returnedSources ?? sourceCount),
+      broadeningApplied,
+      contentRowsRead: this.nonNegativeInt(contentRowsRead),
+    };
   }
 
   private inferEventActor(phase: string): string {

@@ -705,6 +705,15 @@ export class OpenClawService {
       : [
           '18. databaseSourceOptions.enabled 不是 true 时，不得调用 mysql-test__mysql_query 或其他数据库 MCP 工具；继续使用 web-research-firecrawl、用户指定信源和公开检索。',
         ];
+    if (databaseSourceOptions.enabled) {
+      databaseSourceRequirements.push(
+        `24. Database MCP recall must discover all news.data_YYYYMMDD tables through information_schema and check every table within lookbackDays=${databaseSourceOptions.lookbackDays}; do not cap the search to only the latest 10 or 11 tables.`,
+        `25. If strict phrase/entity matching returns fewer than maxMetadataRows=${databaseSourceOptions.maxMetadataRows}, broaden recall with entityTerms, actionTerms, domainTerms, and ngrams as OR conditions across titles, summaries, tags, and designated_tag until the candidate pool reaches maxMetadataRows or all in-window tables are exhausted.`,
+        '26. database_sources.json is a user-visible transparency artifact: keep up to maxMetadataRows URL-deduped metadata rows, including medium/low relevance rows with relevance_level and relevance_reason; do not discard rows solely because only summary matched.',
+        '27. database_query_plan.json must report tables_discovered, tables_checked, strict_hits, expanded_hits, total_hits, returned_sources, broadening_applied, content_rows_read, and database_source_fallback_reason. total_hits must mean candidate-pool size and returned_sources must equal database_sources.json row count.',
+        '28. Preserve title/url fallback fields when ch_title/data_source_url are empty. Never include content, raw_data, SQL, table names, or connection details in the final report or user-visible logs.',
+      );
+    }
     return [
       `6. write-hb 的 report_type 为 ${reportType}，必须按该报种对应大纲撰写，不要混用 K报 与 HB报 结构。`,
       '7. known_context 如果是 JSON，必须先解析其 selectedSearchQueries、userProvidedSources、selectedModules、parameterValues、supplement；selectedModules 可能按章节提供 sectionKey、sectionTitle、selectedDirections；如果解析失败，再按普通文本上下文处理。',
