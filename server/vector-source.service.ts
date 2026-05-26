@@ -25,9 +25,13 @@ export interface VectorSourceItem {
 export interface VectorQueryPlan {
   enabled: boolean;
   available: boolean;
+  storageMode: 'pgvector_chunks' | 'legacy_vector_materials' | 'unavailable';
   embeddingModel: string;
   indexTable: string;
+  activeTable: string;
   sourceTable: string;
+  embeddingColumnType: string;
+  pgvectorAvailable: boolean;
   indexedRows: number;
   vectorHits: number;
   keywordBoostedHits: number;
@@ -67,6 +71,10 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
   private indexTimer: NodeJS.Timeout | null = null;
   private supportsPgVector = false;
   private supportsSourceEmbeddingText = false;
+  private storageMode: VectorQueryPlan['storageMode'] = 'unavailable';
+  private embeddingColumnType = '';
+  private pgvectorAvailable = false;
+  private legacyFallbackReason = '';
   private lastError = '';
   private lastIndexedAt: string | null = null;
   private lastIndexStats = { indexed: 0, skipped: 0 };
@@ -96,16 +104,20 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
     return {
       enabled: Boolean(this.databaseUrl()),
       available,
+      storageMode: available ? this.storageMode : 'unavailable',
       embeddingModel: EMBEDDING_MODEL,
-      indexTable: INDEX_TABLE,
+      indexTable: this.storageMode === 'pgvector_chunks' ? INDEX_TABLE : '',
+      activeTable: this.storageMode === 'pgvector_chunks' ? INDEX_TABLE : SOURCE_TABLE,
       sourceTable: SOURCE_TABLE,
+      embeddingColumnType: this.embeddingColumnType,
+      pgvectorAvailable: this.pgvectorAvailable,
       indexedRows: stats.indexedRows,
       vectorHits: 0,
       keywordBoostedHits: 0,
       returnedSources: 0,
       broadeningApplied: false,
       lastIndexedAt: stats.lastIndexedAt || this.lastIndexedAt,
-      fallbackReason: available ? '' : this.lastError || 'PGVECTOR_DATABASE_URL is not configured',
+      fallbackReason: available ? this.legacyFallbackReason : this.lastError || 'PGVECTOR_DATABASE_URL is not configured',
     };
   }
 
@@ -286,19 +298,45 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
 
   private async initialize(): Promise<boolean> {
     const pool = await this.getPool();
+    const columns = await this.discoverNewsColumns();
+    const embeddingMeta = await this.discoverColumnMeta(SOURCE_TABLE, columns.embedding);
+    this.embeddingColumnType = embeddingMeta
+      ? [embeddingMeta.dataType, embeddingMeta.udtName].filter(Boolean).join('/')
+      : '';
     const available = await pool.query(`SELECT 1 FROM pg_available_extensions WHERE name = 'vector' LIMIT 1`);
+    this.pgvectorAvailable = Boolean(available.rows.length);
+
+    if (SOURCE_TABLE === 'vector_materials' && columns.embedding) {
+      this.supportsPgVector = false;
+      this.supportsSourceEmbeddingText = true;
+      this.storageMode = 'legacy_vector_materials';
+      this.legacyFallbackReason = this.pgvectorAvailable
+        ? ''
+        : 'pgvector extension is unavailable; using legacy_vector_materials text embeddings';
+      await this.ensureLegacyVectorMaterialsSchema();
+      if (this.pgvectorAvailable && embeddingMeta?.udtName === 'vector') {
+        await this.ensureLegacyVectorIndex();
+      }
+      this.lastError = '';
+      return true;
+    }
+
     if (!available.rows.length) {
-      const columns = await this.discoverNewsColumns();
       this.supportsSourceEmbeddingText = Boolean(columns.embedding);
       this.supportsPgVector = false;
+      this.storageMode = this.supportsSourceEmbeddingText ? 'legacy_vector_materials' : 'unavailable';
+      this.legacyFallbackReason = 'pgvector extension is unavailable; using source embedding text column when present';
       if (!this.supportsSourceEmbeddingText) {
         throw new Error('PostgreSQL vector extension is unavailable and source embedding column was not found');
       }
       this.lastError = '';
       return true;
     }
+
     await pool.query('CREATE EXTENSION IF NOT EXISTS vector');
     this.supportsPgVector = true;
+    this.storageMode = 'pgvector_chunks';
+    this.legacyFallbackReason = '';
     await pool.query(
       `CREATE TABLE IF NOT EXISTS ${this.qi(INDEX_TABLE)} (
         id bigserial PRIMARY KEY,
@@ -372,6 +410,63 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
       content: pick('content', 'body', 'text'),
       embedding: pick('embedding'),
     };
+  }
+
+  private async discoverColumnMeta(tableName: string, columnName: string): Promise<{ dataType: string; udtName: string } | null> {
+    if (!columnName) return null;
+    const pool = await this.getPool();
+    const result = await pool.query(
+      `SELECT data_type, udt_name
+         FROM information_schema.columns
+        WHERE table_name = $1
+          AND column_name = $2
+          AND table_schema = ANY (current_schemas(false))
+        LIMIT 1`,
+      [tableName, columnName],
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    return { dataType: String(row.data_type || ''), udtName: String(row.udt_name || '') };
+  }
+
+  private async ensureLegacyVectorMaterialsSchema(): Promise<void> {
+    const pool = await this.getPool();
+    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS mysql_database text`);
+    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS mysql_table_name text`);
+    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS entitle text`);
+    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS data_source_url text`);
+    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS website_name text`);
+    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS tag text`);
+    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS content_hash text`);
+    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS embedding_model text`);
+    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS indexed_at timestamptz`);
+    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS vector_status text`);
+    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS error_message text`);
+    await pool.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS ${this.qi(`${SOURCE_TABLE}_mysql_source_uidx`)}
+         ON ${this.qi(SOURCE_TABLE)} (mysql_database, mysql_table_name, mysql_id, embedding_model)`,
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS ${this.qi(`${SOURCE_TABLE}_publish_time_idx`)}
+         ON ${this.qi(SOURCE_TABLE)} (publish_time DESC NULLS LAST)`,
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS ${this.qi(`${SOURCE_TABLE}_indexed_at_idx`)}
+         ON ${this.qi(SOURCE_TABLE)} (indexed_at DESC NULLS LAST)`,
+    );
+  }
+
+  private async ensureLegacyVectorIndex(): Promise<void> {
+    const pool = await this.getPool();
+    try {
+      await pool.query(
+        `CREATE INDEX IF NOT EXISTS ${this.qi(`${SOURCE_TABLE}_embedding_hnsw_idx`)}
+           ON ${this.qi(SOURCE_TABLE)}
+        USING hnsw (embedding vector_cosine_ops)`,
+      );
+    } catch (error) {
+      this.legacyFallbackReason = `legacy vector index was not created: ${this.safeError(error)}`;
+    }
   }
 
   private sourceKeyExpression(columns: NewsColumns): string {
@@ -627,9 +722,13 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
       queryPlan: {
         enabled: Boolean(this.databaseUrl()),
         available: status !== 'unavailable',
+        storageMode: status !== 'unavailable' ? this.storageMode : 'unavailable',
         embeddingModel: EMBEDDING_MODEL,
-        indexTable: INDEX_TABLE,
+        indexTable: this.storageMode === 'pgvector_chunks' ? INDEX_TABLE : '',
+        activeTable: this.storageMode === 'pgvector_chunks' ? INDEX_TABLE : SOURCE_TABLE,
         sourceTable: SOURCE_TABLE,
+        embeddingColumnType: this.embeddingColumnType,
+        pgvectorAvailable: this.pgvectorAvailable,
         indexedRows: 0,
         vectorHits: 0,
         keywordBoostedHits: 0,

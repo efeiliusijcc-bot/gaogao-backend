@@ -7,6 +7,7 @@
     "dev": "vite",
     "server": "tsc -p tsconfig.server.json && node dist-server/server/index.js",
     "dev:all": "concurrently \"pnpm dev\" \"pnpm server\"",
+    "backfill:vector-materials": "tsx scripts/backfill-vector-materials.ts",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"

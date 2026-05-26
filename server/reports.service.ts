@@ -38,7 +38,9 @@ interface DatabaseQueryPlanSummary {
 interface VectorQueryPlanSummary {
   enabled: boolean;
   available: boolean;
+  storageMode: string;
   embeddingModel: string;
+  activeTable: string;
   indexedRows: number;
   vectorHits: number;
   keywordBoostedHits: number;
@@ -698,7 +700,9 @@ export class ReportsService {
     return {
       enabled: Boolean(plan?.enabled),
       available: Boolean(plan?.available),
+      storageMode: this.sanitizeLogText(String(plan?.storageMode || ''), 80),
       embeddingModel: this.sanitizeLogText(String(plan?.embeddingModel || ''), 80),
+      activeTable: this.sanitizeLogText(String(plan?.activeTable || plan?.sourceTable || ''), 120),
       indexedRows: this.nonNegativeInt(Number(plan?.indexedRows || 0)),
       vectorHits: this.nonNegativeInt(Number(plan?.vectorHits || 0)),
       keywordBoostedHits: this.nonNegativeInt(Number(plan?.keywordBoostedHits || 0)),
@@ -725,9 +729,13 @@ export class ReportsService {
       queryPlan: rawPlan || {
         enabled: false,
         available: false,
+        storageMode: 'unavailable',
         embeddingModel: '',
         indexTable: '',
+        activeTable: '',
         sourceTable: '',
+        embeddingColumnType: '',
+        pgvectorAvailable: false,
         indexedRows: 0,
         vectorHits: 0,
         keywordBoostedHits: 0,
