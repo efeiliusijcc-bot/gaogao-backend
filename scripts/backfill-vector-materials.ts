@@ -67,7 +67,10 @@ async function main() {
     for (const table of tables) {
       if (fetched >= args.maxRows) break;
       const remaining = args.maxRows - fetched;
-      const rows = await fetchMysqlRows(args, table, remaining);
+      const existingIds = await existingMysqlIds(pgPool, args, table);
+      const rows = (await fetchMysqlRows(args, table, remaining + existingIds.size))
+        .filter((row) => !existingIds.has(row.mysql_id))
+        .slice(0, remaining);
       fetched += rows.length;
       const candidates = rows
         .map((row) => ({ row, text: buildEmbeddingText(row) }))
@@ -112,6 +115,23 @@ async function main() {
   }
 }
 
+async function existingMysqlIds(pool: PgPool, args: Args, table: string): Promise<Set<number>> {
+  try {
+    const result = await pool.query(
+      `SELECT mysql_id
+         FROM ${qi(args.pgTable)}
+        WHERE mysql_database = $1
+          AND mysql_table_name = $2
+          AND embedding_model = $3
+          AND embedding_vector IS NOT NULL`,
+      [args.mysqlDatabase, table, args.embeddingModel],
+    );
+    return new Set(result.rows.map((row) => Number(row.mysql_id)).filter((value) => Number.isFinite(value)));
+  } catch {
+    return new Set();
+  }
+}
+
 async function loadArgs(): Promise<Args> {
   const parsed = parseCliArgs(process.argv.slice(2));
   const mysqlContainer = String(parsed.mysqlContainer || process.env.MYSQL_DOCKER_CONTAINER || 'my_mysql');
@@ -119,7 +139,7 @@ async function loadArgs(): Promise<Args> {
   return {
     days: positiveInt(parsed.days, Number(process.env.VECTOR_BACKFILL_DAYS || 1), 30),
     maxRows: positiveInt(parsed.maxRows || parsed.limit, Number(process.env.VECTOR_BACKFILL_MAX_ROWS || 10_000), 100_000),
-    batchSize: positiveInt(parsed.batchSize || parsed.batch, Number(process.env.VECTOR_BACKFILL_BATCH_SIZE || 50), 200),
+    batchSize: positiveInt(parsed.batchSize || parsed.batch, Number(process.env.VECTOR_BACKFILL_BATCH_SIZE || 10), 10),
     mysqlContainer,
     mysqlDatabase: String(parsed.mysqlDatabase || process.env.MYSQL_DATABASE || 'news'),
     mysqlUser: String(parsed.mysqlUser || process.env.MYSQL_USER || 'root'),
