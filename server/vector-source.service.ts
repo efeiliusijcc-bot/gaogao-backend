@@ -60,6 +60,10 @@ const require = createRequire(import.meta.url);
 const EMBEDDING_MODEL = process.env.PGVECTOR_EMBEDDING_MODEL || 'text-embedding-3-small';
 const EMBEDDING_DIMENSIONS = Math.max(1, Number(process.env.PGVECTOR_EMBEDDING_DIMENSIONS || 1536));
 const EMBEDDING_BASE_URL = process.env.PGVECTOR_EMBEDDING_BASE_URL || process.env.OPENAI_BASE_URL || '';
+const EMBEDDING_INPUT_CHARS = Math.max(
+  1,
+  Math.min(8000, Number(process.env.PGVECTOR_EMBEDDING_INPUT_CHARS || (EMBEDDING_MODEL === 'text-embedding-v2' ? 1800 : 8000))),
+);
 const SOURCE_TABLE = process.env.PGVECTOR_NEWS_TABLE || 'news';
 const INDEX_TABLE = process.env.PGVECTOR_INDEX_TABLE || 'news_vector_chunks';
 const INDEX_INTERVAL_MS = Math.max(60_000, Number(process.env.PGVECTOR_INDEX_INTERVAL_MS || 600_000));
@@ -201,6 +205,10 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
   async indexPendingNews(options: { limit?: number } = {}): Promise<{ indexed: number; skipped: number }> {
     const available = await this.ensureReady();
     if (!available) return { indexed: 0, skipped: 0 };
+    if (this.storageMode === 'pgvector_single_table') {
+      this.lastIndexStats = { indexed: 0, skipped: 0 };
+      return this.lastIndexStats;
+    }
     if (!this.supportsPgVector) {
       this.lastIndexStats = { indexed: 0, skipped: 0 };
       return this.lastIndexStats;
@@ -418,6 +426,8 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
       content: pick('content', 'body', 'text'),
       embedding: pick('embedding'),
       embeddingVector: pick('embedding_vector'),
+      embeddingModel: pick('embedding_model'),
+      indexedAt: pick('indexed_at'),
     };
   }
 
@@ -586,6 +596,12 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
     const sourceKeyExpr = this.sourceKeyExpression(columns);
     const freshnessExpr = this.freshnessExpression(columns);
     const field = (alias: string, column: string) => column ? `n.${this.qi(column)}::text AS ${this.qi(alias)}` : `NULL::text AS ${this.qi(alias)}`;
+    const params: unknown[] = [Math.max(input.maxRows * 20, 300)];
+    let where = `WHERE n.${this.qi(columns.embedding)} IS NOT NULL`;
+    if (columns.embeddingModel) {
+      params.push(EMBEDDING_MODEL);
+      where += ` AND n.${this.qi(columns.embeddingModel)} = $${params.length}`;
+    }
     const rows = await pool.query(
       `SELECT ${sourceKeyExpr} AS source_key,
               ${field('url', columns.url)},
@@ -597,10 +613,10 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
               ${freshnessExpr} AS source_time,
               n.${this.qi(columns.embedding)}::text AS embedding
          FROM ${this.qi(SOURCE_TABLE)} n
-        WHERE n.${this.qi(columns.embedding)} IS NOT NULL
+        ${where}
         ORDER BY ${freshnessExpr} DESC NULLS LAST
         LIMIT $1`,
-      [Math.max(input.maxRows * 20, 300)],
+      params,
     );
 
     const terms = this.extractTerms(queryText);
@@ -640,6 +656,10 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
     const vector = this.toVectorLiteral(queryEmbedding);
     const params: unknown[] = [vector, Math.max(input.maxRows * 4, 80)];
     let where = `WHERE n.${this.qi(columns.embeddingVector)} IS NOT NULL`;
+    if (columns.embeddingModel) {
+      params.push(EMBEDDING_MODEL);
+      where += ` AND n.${this.qi(columns.embeddingModel)} = $${params.length}`;
+    }
     const freshness = this.safeLookbackDays(input.lookbackDays);
     if (freshness > 0) {
       params.push(freshness);
@@ -742,7 +762,7 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
     const client = new OpenAI({ apiKey, ...(EMBEDDING_BASE_URL ? { baseURL: EMBEDDING_BASE_URL } : {}) });
     const response = await client.embeddings.create({
       model: EMBEDDING_MODEL,
-      input: texts.map((text) => text.slice(0, 8000)),
+      input: texts.map((text) => text.slice(0, EMBEDDING_INPUT_CHARS)),
       ...(EMBEDDING_DIMENSIONS ? { dimensions: EMBEDDING_DIMENSIONS } : {}),
     });
     return response.data.map((item) => item.embedding);
@@ -758,11 +778,18 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
       if (this.supportsSourceEmbeddingVector) {
         const columns = await this.discoverNewsColumns();
         if (!columns.embeddingVector) return { indexedRows: 0, lastIndexedAt: this.lastIndexedAt };
-        const freshness = this.freshnessExpression(columns).replace(/\bn\./g, '');
+        const freshness = (columns.indexedAt ? this.qi(columns.indexedAt) : this.freshnessExpression(columns).replace(/\bn\./g, ''));
+        const params: unknown[] = [];
+        let where = `WHERE ${this.qi(columns.embeddingVector)} IS NOT NULL`;
+        if (columns.embeddingModel) {
+          params.push(EMBEDDING_MODEL);
+          where += ` AND ${this.qi(columns.embeddingModel)} = $${params.length}`;
+        }
         const result = await pool.query(
           `SELECT count(*)::int AS count, max(${freshness}) AS last_indexed_at
              FROM ${this.qi(SOURCE_TABLE)}
-            WHERE ${this.qi(columns.embeddingVector)} IS NOT NULL`,
+            ${where}`,
+          params,
         );
         return {
           indexedRows: Number(result.rows[0]?.count || 0),
@@ -772,11 +799,18 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
       if (!this.supportsPgVector) {
         const columns = await this.discoverNewsColumns();
         if (!columns.embedding) return { indexedRows: 0, lastIndexedAt: this.lastIndexedAt };
-        const freshness = this.freshnessExpression(columns).replace(/\bn\./g, '');
+        const freshness = (columns.indexedAt ? this.qi(columns.indexedAt) : this.freshnessExpression(columns).replace(/\bn\./g, ''));
+        const params: unknown[] = [];
+        let where = `WHERE ${this.qi(columns.embedding)} IS NOT NULL`;
+        if (columns.embeddingModel) {
+          params.push(EMBEDDING_MODEL);
+          where += ` AND ${this.qi(columns.embeddingModel)} = $${params.length}`;
+        }
         const result = await pool.query(
           `SELECT count(*)::int AS count, max(${freshness}) AS last_indexed_at
              FROM ${this.qi(SOURCE_TABLE)}
-            WHERE ${this.qi(columns.embedding)} IS NOT NULL`,
+            ${where}`,
+          params,
         );
         return {
           indexedRows: Number(result.rows[0]?.count || 0),
