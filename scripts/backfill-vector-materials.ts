@@ -20,6 +20,8 @@ interface Args {
   mysqlPassword: string;
   pgTable: string;
   embeddingModel: string;
+  embeddingBaseUrl: string;
+  embeddingDimensions: number;
   dryRun: boolean;
 }
 
@@ -40,7 +42,7 @@ interface MysqlRow {
 
 const require = createRequire(import.meta.url);
 const execFile = promisify(execFileCallback);
-const EMBEDDING_DIMENSIONS = 1536;
+const DEFAULT_EMBEDDING_DIMENSIONS = 1536;
 
 async function main() {
   const args = await loadArgs();
@@ -61,7 +63,7 @@ async function main() {
     let fetched = 0;
     let indexed = 0;
     let skipped = 0;
-    const openai = openaiKey ? new OpenAI({ apiKey: openaiKey }) : null;
+    const openai = openaiKey ? new OpenAI({ apiKey: openaiKey, ...(args.embeddingBaseUrl ? { baseURL: args.embeddingBaseUrl } : {}) }) : null;
     for (const table of tables) {
       if (fetched >= args.maxRows) break;
       const remaining = args.maxRows - fetched;
@@ -75,7 +77,7 @@ async function main() {
 
       for (let offset = 0; offset < candidates.length; offset += args.batchSize) {
         const batch = candidates.slice(offset, offset + args.batchSize);
-        const embeddings = await embedTexts(openai, args.embeddingModel, batch.map((item) => item.text));
+        const embeddings = await embedTexts(openai, args.embeddingModel, batch.map((item) => item.text), args.embeddingDimensions);
         for (let index = 0; index < batch.length; index += 1) {
           const item = batch[index];
           const embedding = embeddings[index];
@@ -124,6 +126,8 @@ async function loadArgs(): Promise<Args> {
     mysqlPassword: String(parsed.mysqlPassword || process.env.MYSQL_PASSWORD || inspected.MYSQL_ROOT_PASSWORD || inspected.MYSQL_PASSWORD || ''),
     pgTable: String(parsed.pgTable || process.env.PGVECTOR_NEWS_TABLE || 'vector_materials'),
     embeddingModel: String(parsed.embeddingModel || process.env.PGVECTOR_EMBEDDING_MODEL || 'text-embedding-3-small'),
+    embeddingBaseUrl: String(parsed.embeddingBaseUrl || process.env.PGVECTOR_EMBEDDING_BASE_URL || process.env.OPENAI_BASE_URL || ''),
+    embeddingDimensions: positiveInt(parsed.embeddingDimensions || process.env.PGVECTOR_EMBEDDING_DIMENSIONS, DEFAULT_EMBEDDING_DIMENSIONS, 4096),
     dryRun: Boolean(parsed.dryRun || process.env.VECTOR_BACKFILL_DRY_RUN === '1'),
   };
 }
@@ -347,11 +351,11 @@ async function runMysql(args: Args, sql: string): Promise<string> {
   return stdout;
 }
 
-async function embedTexts(openai: OpenAI, model: string, texts: string[]): Promise<number[][]> {
+async function embedTexts(openai: OpenAI, model: string, texts: string[], dimensions: number): Promise<number[][]> {
   const response = await openai.embeddings.create({
     model,
     input: texts.map((text) => text.slice(0, 8000)),
-    dimensions: model === 'text-embedding-3-small' ? EMBEDDING_DIMENSIONS : undefined,
+    ...(dimensions ? { dimensions } : {}),
   });
   return response.data.map((item) => item.embedding);
 }

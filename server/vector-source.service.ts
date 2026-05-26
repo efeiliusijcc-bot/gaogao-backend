@@ -58,7 +58,8 @@ interface VectorSearchInput {
 
 const require = createRequire(import.meta.url);
 const EMBEDDING_MODEL = process.env.PGVECTOR_EMBEDDING_MODEL || 'text-embedding-3-small';
-const EMBEDDING_DIMENSIONS = 1536;
+const EMBEDDING_DIMENSIONS = Math.max(1, Number(process.env.PGVECTOR_EMBEDDING_DIMENSIONS || 1536));
+const EMBEDDING_BASE_URL = process.env.PGVECTOR_EMBEDDING_BASE_URL || process.env.OPENAI_BASE_URL || '';
 const SOURCE_TABLE = process.env.PGVECTOR_NEWS_TABLE || 'news';
 const INDEX_TABLE = process.env.PGVECTOR_INDEX_TABLE || 'news_vector_chunks';
 const INDEX_INTERVAL_MS = Math.max(60_000, Number(process.env.PGVECTOR_INDEX_INTERVAL_MS || 600_000));
@@ -669,10 +670,11 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async embedTexts(apiKey: string, texts: string[]): Promise<number[][]> {
-    const client = new OpenAI({ apiKey });
+    const client = new OpenAI({ apiKey, ...(EMBEDDING_BASE_URL ? { baseURL: EMBEDDING_BASE_URL } : {}) });
     const response = await client.embeddings.create({
       model: EMBEDDING_MODEL,
       input: texts.map((text) => text.slice(0, 8000)),
+      ...(EMBEDDING_DIMENSIONS ? { dimensions: EMBEDDING_DIMENSIONS } : {}),
     });
     return response.data.map((item) => item.embedding);
   }
