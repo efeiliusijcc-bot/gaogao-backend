@@ -4,6 +4,7 @@ import { Subject } from 'rxjs';
 import { v4 as uuid } from 'uuid';
 import { OpenClawApprovalRequiredError, OpenClawService } from './openclaw.service.js';
 import { RemoteFileService } from './remote-file.service.js';
+import { VectorSourceService, type VectorSearchResult, type VectorSourceItem } from './vector-source.service.js';
 import type { CreateJobRequest } from '../src/types/report.js';
 import type { EventLogEntry, JobRecord, RunInput, ServerEvent } from './types.js';
 
@@ -34,6 +35,19 @@ interface DatabaseQueryPlanSummary {
   contentRowsRead: number;
 }
 
+interface VectorQueryPlanSummary {
+  enabled: boolean;
+  available: boolean;
+  embeddingModel: string;
+  indexedRows: number;
+  vectorHits: number;
+  keywordBoostedHits: number;
+  returnedSources: number;
+  broadeningApplied: boolean;
+  lastIndexedAt: string | null;
+  fallbackReason: string;
+}
+
 interface DatabaseSourcesResponse {
   status: 'hit' | 'empty' | 'fallback' | 'unavailable';
   sources: DatabaseSourceItem[];
@@ -41,6 +55,8 @@ interface DatabaseSourcesResponse {
   totalHits: number;
   updatedAt: string | null;
   queryPlan: DatabaseQueryPlanSummary;
+  retrievalMode?: 'keyword' | 'vector' | 'hybrid';
+  vectorPlan?: VectorQueryPlanSummary;
 }
 
 @Injectable()
@@ -52,6 +68,7 @@ export class ReportsService {
   constructor(
     private readonly openClaw: OpenClawService,
     private readonly remoteFs: RemoteFileService,
+    private readonly vectorSources: VectorSourceService,
   ) {
     void this.loadPersistedJobs();
   }
@@ -244,6 +261,20 @@ export class ReportsService {
 
     const dir = await this.resolveOpenClawJobDir(job);
     if (!dir) {
+      const vectorResult = this.vectorResultFromJob(job);
+      const vectorSources = this.normalizeVectorSources(vectorResult?.sources || []).slice(0, 50);
+      if (vectorSources.length) {
+        return {
+          status: 'hit',
+          sources: vectorSources,
+          fallbackReason: '',
+          totalHits: Math.max(vectorResult?.totalHits || 0, vectorSources.length),
+          updatedAt: vectorResult?.updatedAt || null,
+          queryPlan: this.emptyDatabaseQueryPlanSummary(),
+          retrievalMode: 'vector',
+          vectorPlan: this.buildVectorQueryPlanSummary(vectorResult),
+        };
+      }
       return {
         status: 'unavailable',
         sources: [],
@@ -251,6 +282,8 @@ export class ReportsService {
         totalHits: 0,
         updatedAt: null,
         queryPlan: this.emptyDatabaseQueryPlanSummary(),
+        retrievalMode: 'keyword',
+        vectorPlan: this.buildVectorQueryPlanSummary(vectorResult),
       };
     }
 
@@ -260,10 +293,14 @@ export class ReportsService {
     const planObject = plan && !Array.isArray(plan) ? plan : null;
     const sourcesRaw = await this.readJsonFile(sourcesPath);
     const sourcesList = Array.isArray(sourcesRaw) ? sourcesRaw : [];
-    const sources = this.normalizeDatabaseSources(sourcesList).slice(0, 50);
+    const vectorResult = this.vectorResultFromJob(job);
+    const vectorSources = this.normalizeVectorSources(vectorResult?.sources || []);
+    const sources = this.mergeDatabaseSources(vectorSources, this.normalizeDatabaseSources(sourcesList)).slice(0, 50);
     const queryPlan = this.buildDatabaseQueryPlanSummary(planObject, sources.length);
+    const vectorPlan = this.buildVectorQueryPlanSummary(vectorResult);
     const fallbackReason = this.sanitizeLogText(
-      this.firstString(planObject, ['database_source_fallback_reason', 'fallbackReason', 'fallback_reason']),
+      this.firstString(planObject, ['database_source_fallback_reason', 'fallbackReason', 'fallback_reason']) ||
+        vectorPlan.fallbackReason,
       300,
     );
 
@@ -281,7 +318,8 @@ export class ReportsService {
     }
 
     const planTotalHits = this.firstNumber(planObject, ['total_hits', 'totalHits', 'relevant_hits']) || 0;
-    const totalHits = Math.max(planTotalHits, sources.length);
+    const vectorTotalHits = vectorResult?.totalHits || 0;
+    const totalHits = Math.max(planTotalHits + vectorTotalHits, sources.length);
     const status: DatabaseSourcesResponse['status'] = sources.length
       ? 'hit'
       : fallbackReason
@@ -290,7 +328,74 @@ export class ReportsService {
           ? 'empty'
           : 'unavailable';
 
-    return { status, sources, fallbackReason, totalHits, updatedAt, queryPlan };
+    const retrievalMode = vectorSources.length && sourcesList.length
+      ? 'hybrid'
+      : vectorSources.length
+        ? 'vector'
+        : 'keyword';
+
+    return { status, sources, fallbackReason, totalHits, updatedAt, queryPlan, retrievalMode, vectorPlan };
+  }
+
+  private async enrichPayloadWithVectorSources(job: JobRecord): Promise<Record<string, unknown>> {
+    const payload = { ...(job.payload as unknown as Record<string, unknown>) };
+    if (job.skill !== 'write-hb') return payload;
+
+    const knownContext = typeof payload.known_context === 'string' ? payload.known_context : '';
+    const parsed = this.parseJsonObject(knownContext) || {};
+    const databaseOptions = parsed.databaseSourceOptions && typeof parsed.databaseSourceOptions === 'object' && !Array.isArray(parsed.databaseSourceOptions)
+      ? parsed.databaseSourceOptions as Record<string, unknown>
+      : {};
+    const databaseEnabled = databaseOptions.enabled === true || String(databaseOptions.enabled).toLowerCase() === 'true';
+    if (!databaseEnabled) return payload;
+
+    const maxRows = this.boundInt(databaseOptions.maxMetadataRows, 50, 1, 100);
+    const lookbackDays = this.boundInt(databaseOptions.lookbackDays, 30, 0, 365);
+    const result = await this.vectorSources.search({
+      topic: String(payload.topic || parsed.topic || ''),
+      knownContext: parsed,
+      maxRows,
+      lookbackDays,
+    });
+
+    job.artifacts = {
+      ...job.artifacts,
+      vectorDatabaseSources: result.sources,
+      vectorDatabaseQueryPlan: result.queryPlan,
+      vectorDatabaseSourceStatus: result.status,
+    };
+    await this.writeJobState(job);
+
+    const enrichedContext = {
+      ...parsed,
+      vectorDatabaseSourceOptions: {
+        enabled: true,
+        provider: 'postgres_pgvector',
+        mode: 'semantic_summary',
+        lookbackDays,
+        maxMetadataRows: maxRows,
+      },
+      vectorDatabaseSources: result.sources,
+      vectorDatabaseQueryPlan: result.queryPlan,
+    };
+    payload.known_context = JSON.stringify(enrichedContext, null, 2);
+    return payload;
+  }
+
+  private parseJsonObject(text: string): Record<string, unknown> | null {
+    if (!text.trim()) return null;
+    try {
+      const parsed = JSON.parse(text) as unknown;
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private boundInt(raw: unknown, fallback: number, min: number, max: number): number {
+    const parsed = typeof raw === 'number' ? raw : Number(String(raw ?? ''));
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.max(min, Math.min(max, Math.floor(parsed)));
   }
 
   private async runJob(job: JobRecord) {
@@ -301,9 +406,10 @@ export class ReportsService {
 
     try {
       const requestUser = this.buildRequestUser(job);
+      const enrichedPayload = await this.enrichPayloadWithVectorSources(job);
       const runInput: RunInput = {
         skill: job.skill,
-        payload: job.payload as unknown as Record<string, unknown>,
+        payload: enrichedPayload,
         requestUser,
         onEvent: (event) => this.pushEvent(job, event),
         jobId: job.jobId,
@@ -573,6 +679,77 @@ export class ReportsService {
       broadeningApplied,
       contentRowsRead: this.nonNegativeInt(contentRowsRead),
     };
+  }
+
+  private buildVectorQueryPlanSummary(result: VectorSearchResult | null): VectorQueryPlanSummary {
+    const plan = result?.queryPlan;
+    return {
+      enabled: Boolean(plan?.enabled),
+      available: Boolean(plan?.available),
+      embeddingModel: this.sanitizeLogText(String(plan?.embeddingModel || ''), 80),
+      indexedRows: this.nonNegativeInt(Number(plan?.indexedRows || 0)),
+      vectorHits: this.nonNegativeInt(Number(plan?.vectorHits || 0)),
+      keywordBoostedHits: this.nonNegativeInt(Number(plan?.keywordBoostedHits || 0)),
+      returnedSources: this.nonNegativeInt(Number(plan?.returnedSources || result?.sources.length || 0)),
+      broadeningApplied: Boolean(plan?.broadeningApplied),
+      lastIndexedAt: plan?.lastIndexedAt || null,
+      fallbackReason: this.sanitizeLogText(String(plan?.fallbackReason || ''), 300),
+    };
+  }
+
+  private vectorResultFromJob(job: JobRecord): VectorSearchResult | null {
+    const sources = Array.isArray(job.artifacts?.vectorDatabaseSources)
+      ? job.artifacts.vectorDatabaseSources as VectorSourceItem[]
+      : [];
+    const rawPlan = job.artifacts?.vectorDatabaseQueryPlan && typeof job.artifacts.vectorDatabaseQueryPlan === 'object'
+      ? job.artifacts.vectorDatabaseQueryPlan as VectorSearchResult['queryPlan']
+      : null;
+    const status = String(job.artifacts?.vectorDatabaseSourceStatus || (sources.length ? 'hit' : rawPlan?.fallbackReason ? 'fallback' : 'unavailable'));
+    if (!sources.length && !rawPlan) return null;
+    return {
+      status: ['hit', 'empty', 'fallback', 'unavailable'].includes(status) ? status as VectorSearchResult['status'] : 'unavailable',
+      sources,
+      totalHits: Math.max(Number(rawPlan?.vectorHits || 0), sources.length),
+      queryPlan: rawPlan || {
+        enabled: false,
+        available: false,
+        embeddingModel: '',
+        indexTable: '',
+        sourceTable: '',
+        indexedRows: 0,
+        vectorHits: 0,
+        keywordBoostedHits: 0,
+        returnedSources: sources.length,
+        broadeningApplied: false,
+        lastIndexedAt: null,
+        fallbackReason: '',
+      },
+      updatedAt: rawPlan?.lastIndexedAt || null,
+    };
+  }
+
+  private normalizeVectorSources(items: VectorSourceItem[]): DatabaseSourceItem[] {
+    return items
+      .map((item) => ({
+        title: this.sanitizeLogText(item.title || '', 200),
+        url: this.sanitizeLogText(item.url || '', 500),
+        summary: this.sanitizeLogText(item.summary || '', 1000),
+        websiteName: this.sanitizeLogText(item.websiteName || '', 120),
+        publishTime: this.sanitizeLogText(item.publishTime || '', 60),
+      }))
+      .filter((item) => item.title || item.url);
+  }
+
+  private mergeDatabaseSources(primary: DatabaseSourceItem[], secondary: DatabaseSourceItem[]): DatabaseSourceItem[] {
+    const seen = new Set<string>();
+    const merged: DatabaseSourceItem[] = [];
+    for (const item of [...primary, ...secondary]) {
+      const key = item.url || `${item.title}|${item.summary}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(item);
+    }
+    return merged;
   }
 
   private inferEventActor(phase: string): string {

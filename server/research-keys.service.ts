@@ -3,12 +3,13 @@ import fs from 'fs/promises';
 import path from 'path';
 import { OPENCLAW_STATE_DIR } from './config.js';
 
-type ResearchKeyName = 'tavilyApiKey' | 'exaApiKey' | 'firecrawlApiKey';
+type ResearchKeyName = 'tavilyApiKey' | 'exaApiKey' | 'firecrawlApiKey' | 'openaiEmbeddingApiKey';
 
 interface ResearchKeysFile {
   tavilyApiKey?: string;
   exaApiKey?: string;
   firecrawlApiKey?: string;
+  openaiEmbeddingApiKey?: string;
   updatedAt?: string;
 }
 
@@ -16,6 +17,7 @@ export interface ResearchKeysStatus {
   tavilyApiKey: { configured: boolean };
   exaApiKey: { configured: boolean };
   firecrawlApiKey: { configured: boolean };
+  openaiEmbeddingApiKey: { configured: boolean };
   updatedAt: string | null;
 }
 
@@ -23,6 +25,7 @@ export interface UpdateResearchKeysInput {
   tavilyApiKey?: string | null;
   exaApiKey?: string | null;
   firecrawlApiKey?: string | null;
+  openaiEmbeddingApiKey?: string | null;
 }
 
 const CONFIG_DIR = path.join(OPENCLAW_STATE_DIR, 'workspace', 'report-agent', 'config');
@@ -33,6 +36,7 @@ const ENV_NAMES: Record<ResearchKeyName, string> = {
   tavilyApiKey: 'TAVILY_API_KEY',
   exaApiKey: 'EXA_API_KEY',
   firecrawlApiKey: 'FIRECRAWL_API_KEY',
+  openaiEmbeddingApiKey: 'OPENAI_API_KEY',
 };
 
 @Injectable()
@@ -106,6 +110,7 @@ export class ResearchKeysService {
       tavilyApiKey: { configured: Boolean(keys.tavilyApiKey) },
       exaApiKey: { configured: Boolean(keys.exaApiKey) },
       firecrawlApiKey: { configured: Boolean(keys.firecrawlApiKey) },
+      openaiEmbeddingApiKey: { configured: Boolean(keys.openaiEmbeddingApiKey || process.env.OPENAI_API_KEY) },
       updatedAt: keys.updatedAt || null,
     };
   }

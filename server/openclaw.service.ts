@@ -712,6 +712,8 @@ export class OpenClawService {
         '26. database_sources.json is a user-visible transparency artifact: keep up to maxMetadataRows URL-deduped metadata rows, including medium/low relevance rows with relevance_level and relevance_reason; do not discard rows solely because only summary matched.',
         '27. database_query_plan.json must report tables_discovered, tables_checked, strict_hits, expanded_hits, total_hits, returned_sources, broadening_applied, content_rows_read, and database_source_fallback_reason. total_hits must mean candidate-pool size and returned_sources must equal database_sources.json row count.',
         '28. Preserve title/url fallback fields when ch_title/data_source_url are empty. Never include content, raw_data, SQL, table names, or connection details in the final report or user-visible logs.',
+        '29. If context.json contains vectorDatabaseSources, treat them as PostgreSQL pgvector semantic database sources. Save them verbatim to database/vector_sources.json, merge them with database_sources.json and public research evidence, and cite only after cross-checking with Tavily/Exa/Firecrawl or other credible sources.',
+        '30. vectorDatabaseSources are additive evidence only: they must not replace mysql-test__mysql_query, harness_cli.py plan/run, Tavily, Exa, Firecrawl, research_*.json, consolidated.json, or synthesis steps.',
       );
     }
     return [

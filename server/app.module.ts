@@ -10,9 +10,11 @@ import { ResearchKeysController } from './research-keys.controller.js';
 import { ResearchKeysService } from './research-keys.service.js';
 import { ReportsController } from './reports.controller.js';
 import { ReportsService } from './reports.service.js';
+import { VectorSourcesController } from './vector-sources.controller.js';
+import { VectorSourceService } from './vector-source.service.js';
 
 @Module({
-  controllers: [HealthController, ReportsController, ReportPlansController, ResearchKeysController, ChatController],
-  providers: [OpenClawService, OpenClawGatewayDeviceService, RemoteFileService, ReportsService, ResearchKeysService, ChatService],
+  controllers: [HealthController, ReportsController, ReportPlansController, ResearchKeysController, VectorSourcesController, ChatController],
+  providers: [OpenClawService, OpenClawGatewayDeviceService, RemoteFileService, ReportsService, ResearchKeysService, VectorSourceService, ChatService],
 })
 export class AppModule {}

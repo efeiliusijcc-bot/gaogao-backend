@@ -107,6 +107,28 @@ export interface DatabaseSourcesResponse {
   fallbackReason: string;
   totalHits: number;
   updatedAt: string | null;
+  retrievalMode?: 'keyword' | 'vector' | 'hybrid';
+  queryPlan?: {
+    tablesDiscovered: number;
+    tablesChecked: number;
+    strictHits: number;
+    expandedHits: number;
+    returnedSources: number;
+    broadeningApplied: boolean;
+    contentRowsRead: number;
+  };
+  vectorPlan?: {
+    enabled: boolean;
+    available: boolean;
+    embeddingModel: string;
+    indexedRows: number;
+    vectorHits: number;
+    keywordBoostedHits: number;
+    returnedSources: number;
+    broadeningApplied: boolean;
+    lastIndexedAt: string | null;
+    fallbackReason: string;
+  };
 }
 
 export type SSEEvent =
