@@ -23,6 +23,7 @@ interface Args {
   embeddingBaseUrl: string;
   embeddingDimensions: number;
   maxTextChars: number;
+  allowMixedModels: boolean;
   dryRun: boolean;
 }
 
@@ -55,6 +56,7 @@ async function main() {
     }
 
     const schema = await ensureVectorMaterialsSchema(pgPool, args.pgTable);
+    await assertModelCompatibility(pgPool, args);
     const tables = await discoverMysqlDailyTables(args);
     if (!tables.length) {
       console.log(JSON.stringify({ status: 'empty', reason: 'No recent MySQL daily tables were found', days: args.days }, null, 2));
@@ -150,6 +152,7 @@ async function loadArgs(): Promise<Args> {
     embeddingBaseUrl: String(parsed.embeddingBaseUrl || process.env.PGVECTOR_EMBEDDING_BASE_URL || process.env.OPENAI_BASE_URL || ''),
     embeddingDimensions: positiveInt(parsed.embeddingDimensions || process.env.PGVECTOR_EMBEDDING_DIMENSIONS, DEFAULT_EMBEDDING_DIMENSIONS, 4096),
     maxTextChars: positiveInt(parsed.maxTextChars || process.env.VECTOR_BACKFILL_MAX_TEXT_CHARS, defaultMaxTextChars(String(parsed.embeddingModel || process.env.PGVECTOR_EMBEDDING_MODEL || 'text-embedding-3-small')), 8000),
+    allowMixedModels: Boolean(parsed.allowMixedModels || process.env.VECTOR_BACKFILL_ALLOW_MIXED_MODELS === '1'),
     dryRun: Boolean(parsed.dryRun || process.env.VECTOR_BACKFILL_DRY_RUN === '1'),
   };
 }
@@ -185,6 +188,28 @@ async function getPgPool(): Promise<PgPool> {
   if (!url) throw new Error('PGVECTOR_DATABASE_URL is not configured');
   const { Pool } = require('pg') as { Pool: new (config: Record<string, unknown>) => PgPool };
   return new Pool({ connectionString: url, max: 4, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 10_000 });
+}
+
+async function assertModelCompatibility(pool: PgPool, args: Args): Promise<void> {
+  if (args.allowMixedModels) return;
+  const result = await pool.query(
+    `SELECT embedding_model, count(*)::int AS rows
+       FROM ${qi(args.pgTable)}
+      WHERE embedding_model IS NOT NULL
+        AND embedding_model <> $1
+      GROUP BY embedding_model
+      ORDER BY rows DESC`,
+    [args.embeddingModel],
+  );
+  if (!result.rows.length) return;
+  const existing = result.rows
+    .map((row) => `${String(row.embedding_model || 'unknown')}=${Number(row.rows || 0)}`)
+    .join(', ');
+  throw new Error(
+    `Vector table already contains embeddings from another model (${existing}). ` +
+    `Refusing to mix embedding spaces with ${args.embeddingModel}. ` +
+    `Use the same model for incremental sync, create a separate table, or pass --allow-mixed-models only if you explicitly accept mixed-model retrieval quality risk.`,
+  );
 }
 
 async function effectiveOpenAiKey(): Promise<string> {
