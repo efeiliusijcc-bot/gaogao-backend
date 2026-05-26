@@ -222,12 +222,16 @@ async function ensureVectorMaterialsSchema(pool: PgPool, table: string): Promise
     ['tag', 'text'],
     ['content_hash', 'text'],
     ['embedding_model', 'text'],
+    ['embedding_dimensions', 'integer'],
     ['indexed_at', 'timestamptz'],
     ['vector_status', 'text'],
     ['error_message', 'text'],
   ];
   for (const [name, type] of addColumns) {
     await pool.query(`ALTER TABLE ${qi(table)} ADD COLUMN IF NOT EXISTS ${qi(name)} ${type}`);
+  }
+  if (pgvectorAvailable) {
+    await pool.query(`ALTER TABLE ${qi(table)} ADD COLUMN IF NOT EXISTS embedding_vector vector(1536)`);
   }
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS ${qi(`${table}_mysql_source_uidx`)} ON ${qi(table)} (mysql_database, mysql_table_name, mysql_id, embedding_model)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS ${qi(`${table}_publish_time_idx`)} ON ${qi(table)} (publish_time DESC NULLS LAST)`);
@@ -244,9 +248,9 @@ async function ensureVectorMaterialsSchema(pool: PgPool, table: string): Promise
   );
   const embeddingStorage = String(meta.rows[0]?.udt_name || '') === 'vector' ? 'vector' : 'text';
   let fallbackReason = '';
-  if (pgvectorAvailable && embeddingStorage === 'vector') {
+  if (pgvectorAvailable) {
     try {
-      await pool.query(`CREATE INDEX IF NOT EXISTS ${qi(`${table}_embedding_hnsw_idx`)} ON ${qi(table)} USING hnsw (embedding vector_cosine_ops)`);
+      await pool.query(`CREATE INDEX IF NOT EXISTS ${qi(`${table}_embedding_hnsw_idx`)} ON ${qi(table)} USING hnsw (embedding_vector vector_cosine_ops)`);
     } catch (error) {
       fallbackReason = safeError(error);
     }
@@ -369,13 +373,14 @@ async function upsertVectorMaterial(
   embedding: number[],
 ): Promise<void> {
   const embeddingValue = toVectorLiteral(embedding);
-  const embeddingPlaceholder = embeddingStorage === 'vector' ? '$15::vector' : '$15';
+  const vectorPlaceholder = embeddingStorage === 'vector' ? '$15::vector' : '$15';
+  const vectorColumnValue = '$16::vector';
   await pool.query(
     `INSERT INTO ${qi(args.pgTable)}
       (mysql_database, mysql_table_name, mysql_id, ch_title, entitle, summary, publish_time,
        designated_tag, data_type, data_source_url, website_name, tag, content_hash, embedding_model,
-       embedding, indexed_at, vector_status, error_message)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,${embeddingPlaceholder},now(),'ready',NULL)
+       embedding, embedding_vector, embedding_dimensions, indexed_at, vector_status, error_message)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,${vectorPlaceholder},${vectorColumnValue},$17,now(),'ready',NULL)
      ON CONFLICT (mysql_database, mysql_table_name, mysql_id, embedding_model)
      DO UPDATE SET
        ch_title = EXCLUDED.ch_title,
@@ -389,6 +394,8 @@ async function upsertVectorMaterial(
        tag = EXCLUDED.tag,
        content_hash = EXCLUDED.content_hash,
        embedding = EXCLUDED.embedding,
+       embedding_vector = EXCLUDED.embedding_vector,
+       embedding_dimensions = EXCLUDED.embedding_dimensions,
        indexed_at = now(),
        vector_status = 'ready',
        error_message = NULL`,
@@ -408,6 +415,8 @@ async function upsertVectorMaterial(
       crypto.createHash('sha256').update(text).digest('hex'),
       args.embeddingModel,
       embeddingValue,
+      embeddingValue,
+      embedding.length,
     ],
   );
 }

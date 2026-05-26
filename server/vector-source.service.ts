@@ -25,7 +25,7 @@ export interface VectorSourceItem {
 export interface VectorQueryPlan {
   enabled: boolean;
   available: boolean;
-  storageMode: 'pgvector_chunks' | 'legacy_vector_materials' | 'unavailable';
+  storageMode: 'pgvector_chunks' | 'legacy_vector_materials' | 'pgvector_single_table' | 'unavailable';
   embeddingModel: string;
   indexTable: string;
   activeTable: string;
@@ -72,6 +72,7 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
   private indexTimer: NodeJS.Timeout | null = null;
   private supportsPgVector = false;
   private supportsSourceEmbeddingText = false;
+  private supportsSourceEmbeddingVector = false;
   private storageMode: VectorQueryPlan['storageMode'] = 'unavailable';
   private embeddingColumnType = '';
   private pgvectorAvailable = false;
@@ -145,6 +146,9 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
     try {
       const queryText = this.buildQueryText(input.topic, input.knownContext);
       const embedding = await this.embedTexts(apiKey, [queryText]);
+      if (this.supportsSourceEmbeddingVector) {
+        return this.searchSourceEmbeddingVector(input, embedding[0] || [], queryText);
+      }
       if (!this.supportsPgVector) {
         return this.searchSourceEmbeddingText(input, embedding[0] || [], queryText);
       }
@@ -308,14 +312,17 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
     this.pgvectorAvailable = Boolean(available.rows.length);
 
     if (SOURCE_TABLE === 'vector_materials' && columns.embedding) {
-      this.supportsPgVector = false;
+      this.supportsPgVector = Boolean(this.pgvectorAvailable && columns.embeddingVector);
       this.supportsSourceEmbeddingText = true;
-      this.storageMode = 'legacy_vector_materials';
-      this.legacyFallbackReason = this.pgvectorAvailable
+      this.supportsSourceEmbeddingVector = Boolean(this.supportsPgVector);
+      this.storageMode = this.supportsSourceEmbeddingVector ? 'pgvector_single_table' : 'legacy_vector_materials';
+      this.legacyFallbackReason = this.supportsSourceEmbeddingVector
         ? ''
+        : this.pgvectorAvailable
+        ? 'pgvector is available but embedding_vector column is not ready; using legacy text embeddings'
         : 'pgvector extension is unavailable; using legacy_vector_materials text embeddings';
       await this.ensureLegacyVectorMaterialsSchema();
-      if (this.pgvectorAvailable && embeddingMeta?.udtName === 'vector') {
+      if (this.supportsSourceEmbeddingVector) {
         await this.ensureLegacyVectorIndex();
       }
       this.lastError = '';
@@ -410,6 +417,7 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
       sourceTime: pick('crawl_time', 'crawled_at', 'created_at', 'updated_at', 'inserted_at', 'publish_time'),
       content: pick('content', 'body', 'text'),
       embedding: pick('embedding'),
+      embeddingVector: pick('embedding_vector'),
     };
   }
 
@@ -440,6 +448,10 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
     await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS tag text`);
     await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS content_hash text`);
     await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS embedding_model text`);
+    if (this.pgvectorAvailable) {
+      await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS embedding_vector vector(${EMBEDDING_DIMENSIONS})`);
+      await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS embedding_dimensions integer`);
+    }
     await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS indexed_at timestamptz`);
     await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS vector_status text`);
     await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS error_message text`);
@@ -463,7 +475,7 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
       await pool.query(
         `CREATE INDEX IF NOT EXISTS ${this.qi(`${SOURCE_TABLE}_embedding_hnsw_idx`)}
            ON ${this.qi(SOURCE_TABLE)}
-        USING hnsw (embedding vector_cosine_ops)`,
+        USING hnsw (embedding_vector vector_cosine_ops)`,
       );
     } catch (error) {
       this.legacyFallbackReason = `legacy vector index was not created: ${this.safeError(error)}`;
@@ -617,6 +629,63 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
+  private async searchSourceEmbeddingVector(input: VectorSearchInput, queryEmbedding: number[], queryText: string): Promise<VectorSearchResult> {
+    const columns = await this.discoverNewsColumns();
+    if (!columns.embeddingVector) return this.emptyResult('fallback', 'Source embedding_vector column was not found');
+
+    const pool = await this.getPool();
+    const sourceKeyExpr = this.sourceKeyExpression(columns);
+    const freshnessExpr = this.freshnessExpression(columns);
+    const field = (alias: string, column: string) => column ? `n.${this.qi(column)}::text AS ${this.qi(alias)}` : `NULL::text AS ${this.qi(alias)}`;
+    const vector = this.toVectorLiteral(queryEmbedding);
+    const params: unknown[] = [vector, Math.max(input.maxRows * 4, 80)];
+    let where = `WHERE n.${this.qi(columns.embeddingVector)} IS NOT NULL`;
+    const freshness = this.safeLookbackDays(input.lookbackDays);
+    if (freshness > 0) {
+      params.push(freshness);
+      where += ` AND (${freshnessExpr} IS NULL OR ${freshnessExpr} >= now() - ($${params.length}::int * interval '1 day'))`;
+    }
+    const rows = await pool.query(
+      `SELECT ${sourceKeyExpr} AS source_key,
+              ${field('url', columns.url)},
+              ${field('ch_title', columns.chTitle)},
+              ${field('entitle', columns.entitle)},
+              ${field('summary', columns.summary)},
+              ${field('website_name', columns.websiteName)},
+              ${columns.publishTime ? `n.${this.qi(columns.publishTime)}::timestamptz` : 'NULL::timestamptz'} AS publish_time,
+              ${freshnessExpr} AS source_time,
+              1 - (n.${this.qi(columns.embeddingVector)} <=> $1::vector) AS similarity
+         FROM ${this.qi(SOURCE_TABLE)} n
+        ${where}
+        ORDER BY n.${this.qi(columns.embeddingVector)} <=> $1::vector
+        LIMIT $2`,
+      params,
+    );
+
+    const terms = this.extractTerms(queryText);
+    const scored = rows.rows
+      .map((row) => this.rowToSource({ ...row, source_url: row.url }, terms))
+      .filter((item) => item.url || item.title || item.summary)
+      .sort((a, b) => b.relevanceScore - a.relevanceScore);
+    const sources = this.dedupeSources(scored).slice(0, input.maxRows);
+    const keywordBoostedHits = scored.filter((item) => item.relevanceScore - item.similarity > 0.05).length;
+    const plan = await this.status();
+    plan.available = true;
+    plan.storageMode = 'pgvector_single_table';
+    plan.vectorHits = scored.length;
+    plan.keywordBoostedHits = keywordBoostedHits;
+    plan.returnedSources = sources.length;
+    plan.broadeningApplied = keywordBoostedHits > 0;
+    plan.fallbackReason = '';
+    return {
+      status: sources.length ? 'hit' : 'empty',
+      sources,
+      totalHits: scored.length,
+      queryPlan: plan,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
   private parseVectorText(value: string): number[] {
     const normalized = value.trim().replace(/^\[/, '').replace(/\]$/, '');
     if (!normalized) return [];
@@ -686,6 +755,20 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
   private async indexStats(): Promise<{ indexedRows: number; lastIndexedAt: string | null }> {
     try {
       const pool = await this.getPool();
+      if (this.supportsSourceEmbeddingVector) {
+        const columns = await this.discoverNewsColumns();
+        if (!columns.embeddingVector) return { indexedRows: 0, lastIndexedAt: this.lastIndexedAt };
+        const freshness = this.freshnessExpression(columns).replace(/\bn\./g, '');
+        const result = await pool.query(
+          `SELECT count(*)::int AS count, max(${freshness}) AS last_indexed_at
+             FROM ${this.qi(SOURCE_TABLE)}
+            WHERE ${this.qi(columns.embeddingVector)} IS NOT NULL`,
+        );
+        return {
+          indexedRows: Number(result.rows[0]?.count || 0),
+          lastIndexedAt: this.dateString(result.rows[0]?.last_indexed_at) || this.lastIndexedAt,
+        };
+      }
       if (!this.supportsPgVector) {
         const columns = await this.discoverNewsColumns();
         if (!columns.embedding) return { indexedRows: 0, lastIndexedAt: this.lastIndexedAt };
