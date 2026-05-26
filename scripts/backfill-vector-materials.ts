@@ -22,6 +22,7 @@ interface Args {
   embeddingModel: string;
   embeddingBaseUrl: string;
   embeddingDimensions: number;
+  maxTextChars: number;
   dryRun: boolean;
 }
 
@@ -73,7 +74,7 @@ async function main() {
         .slice(0, remaining);
       fetched += rows.length;
       const candidates = rows
-        .map((row) => ({ row, text: buildEmbeddingText(row) }))
+        .map((row) => ({ row, text: buildEmbeddingText(row, args.maxTextChars) }))
         .filter((item) => item.row.mysql_id && item.text.length >= 12);
       skipped += rows.length - candidates.length;
       if (args.dryRun || !openai) continue;
@@ -148,6 +149,7 @@ async function loadArgs(): Promise<Args> {
     embeddingModel: String(parsed.embeddingModel || process.env.PGVECTOR_EMBEDDING_MODEL || 'text-embedding-3-small'),
     embeddingBaseUrl: String(parsed.embeddingBaseUrl || process.env.PGVECTOR_EMBEDDING_BASE_URL || process.env.OPENAI_BASE_URL || ''),
     embeddingDimensions: positiveInt(parsed.embeddingDimensions || process.env.PGVECTOR_EMBEDDING_DIMENSIONS, DEFAULT_EMBEDDING_DIMENSIONS, 4096),
+    maxTextChars: positiveInt(parsed.maxTextChars || process.env.VECTOR_BACKFILL_MAX_TEXT_CHARS, defaultMaxTextChars(String(parsed.embeddingModel || process.env.PGVECTOR_EMBEDDING_MODEL || 'text-embedding-3-small')), 8000),
     dryRun: Boolean(parsed.dryRun || process.env.VECTOR_BACKFILL_DRY_RUN === '1'),
   };
 }
@@ -172,6 +174,10 @@ function positiveInt(value: unknown, fallback: number, max: number): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return Math.max(1, Math.min(max, Math.floor(parsed)));
+}
+
+function defaultMaxTextChars(model: string): number {
+  return model === 'text-embedding-v2' ? 1800 : 6000;
 }
 
 async function getPgPool(): Promise<PgPool> {
@@ -441,7 +447,7 @@ async function upsertVectorMaterial(
   );
 }
 
-function buildEmbeddingText(row: MysqlRow): string {
+function buildEmbeddingText(row: MysqlRow, maxTextChars: number): string {
   return [
     row.ch_title,
     row.entitle,
@@ -455,7 +461,7 @@ function buildEmbeddingText(row: MysqlRow): string {
     .join('\n')
     .replace(/\s+/g, ' ')
     .trim()
-    .slice(0, 6000);
+    .slice(0, maxTextChars);
 }
 
 function parseDay(value: string): Date {
