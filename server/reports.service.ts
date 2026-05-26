@@ -449,14 +449,26 @@ export class ReportsService {
         }
       }
 
-      const resolvedReport = recoveredReport ?? (await this.resolveOpenClawReportFile(result.markdown, startedAtMs));
+      let resolvedReport = recoveredReport ?? (await this.resolveOpenClawReportFile(result.markdown, startedAtMs, job.jobId));
       const finalMarkdown = resolvedReport?.markdown ?? result.markdown;
       if (!resolvedReport && /^\s*REPORT_FILE\s*:/im.test(finalMarkdown)) {
         throw new Error('OpenClaw returned a REPORT_FILE pointer, but no valid Markdown report file was found.');
       }
-      this.assertUsableGeneratedMarkdown(finalMarkdown);
+      try {
+        this.assertUsableGeneratedMarkdown(finalMarkdown);
+      } catch (validationError) {
+        const lateReport = await this.resolveOpenClawReportFile('', startedAtMs, job.jobId, 150_000);
+        if (!lateReport) throw validationError;
+        this.pushEvent(job, {
+          type: 'stage',
+          stage: 'report_file_recovered',
+          message: `Recovered generated report file after validation fallback: ${lateReport.filePath}`,
+        });
+        resolvedReport = lateReport;
+      }
+      const usableMarkdown = resolvedReport?.markdown ?? finalMarkdown;
       job.status = 'succeeded';
-      job.markdown = finalMarkdown;
+      job.markdown = usableMarkdown;
       job.artifacts = result.artifacts;
       job.resultPath = resolvedReport?.filePath ?? (await this.writeReportFile(job, job.markdown));
       job.updatedAt = new Date().toISOString();
@@ -844,14 +856,35 @@ export class ReportsService {
     }
   }
 
-  private async resolveOpenClawReportFile(markdown: string, startedAtMs: number) {
+  private async resolveOpenClawReportFile(markdown: string, startedAtMs: number, jobId?: string, waitMs = 0) {
+    const deadline = Date.now() + Math.max(0, waitMs);
+    do {
+      const found = await this.resolveOpenClawReportFileOnce(markdown, startedAtMs, jobId);
+      if (found) return found;
+      if (Date.now() >= deadline) break;
+      await this.sleep(5_000);
+    } while (Date.now() < deadline);
+
+    return null;
+  }
+
+  private async resolveOpenClawReportFileOnce(markdown: string, startedAtMs: number, jobId?: string) {
     const fromText = await this.readMarkdownFile(this.extractReportPath(markdown));
     if (fromText) return fromText;
+
+    if (jobId) {
+      const fromJobDir = await this.findMarkdownFileInJobDir(jobId);
+      if (fromJobDir) return fromJobDir;
+    }
 
     const latest = await this.findLatestMarkdownFile(startedAtMs);
     if (latest) return latest;
 
     return null;
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   private extractReportPath(text: string): string | null {
@@ -882,6 +915,42 @@ export class ReportsService {
     } catch {
       return null;
     }
+  }
+
+  private async findMarkdownFileInJobDir(jobId: string) {
+    const reportDir = this.remoteFs.remoteDir;
+    const jobDir = this.remoteFs.joinPath(reportDir, jobId);
+    const priorityPaths = [
+      this.remoteFs.joinPath(jobDir, 'final', 'report.md'),
+      this.remoteFs.joinPath(jobDir, 'report.md'),
+    ];
+
+    for (const filePath of priorityPaths) {
+      const report = await this.readMarkdownFile(filePath);
+      if (report) return report;
+    }
+
+    try {
+      const finalDir = this.remoteFs.joinPath(jobDir, 'final');
+      const entries = await this.remoteFs.readdir(finalDir);
+      const files: { filePath: string; stat: { size: number; mtimeMs: number } }[] = [];
+      for (const entry of entries) {
+        if (!entry.isFile || !entry.name.toLowerCase().endsWith('.md')) continue;
+        const filePath = this.remoteFs.joinPath(finalDir, entry.name);
+        try {
+          files.push({ filePath, stat: await this.remoteFs.stat(filePath) });
+        } catch { continue; }
+      }
+      files.sort((a, b) => b.stat.size - a.stat.size || b.stat.mtimeMs - a.stat.mtimeMs);
+      for (const candidate of files) {
+        const report = await this.readMarkdownFile(candidate.filePath);
+        if (report) return report;
+      }
+    } catch {
+      return null;
+    }
+
+    return null;
   }
 
   private async findBestMarkdownFileForJob(job: JobRecord) {
