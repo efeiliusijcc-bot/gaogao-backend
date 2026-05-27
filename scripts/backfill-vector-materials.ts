@@ -46,7 +46,7 @@ interface MysqlRow {
 const require = createRequire(import.meta.url);
 const execFile = promisify(execFileCallback);
 const DEFAULT_EMBEDDING_DIMENSIONS = 1536;
-const QWEN3_EMBEDDING_MODEL = 'Qwen/Qwen3-Embedding-0.6B';
+const QWEN3_EMBEDDING_MODEL = 'Qwen3-Embedding-0.6B-Q8';
 
 async function main() {
   const args = await loadArgs();
@@ -191,12 +191,16 @@ function positiveInt(value: unknown, fallback: number, max: number): number {
 }
 
 function defaultEmbeddingDimensions(model: string): number {
-  return model.toLowerCase() === QWEN3_EMBEDDING_MODEL.toLowerCase() ? 1024 : DEFAULT_EMBEDDING_DIMENSIONS;
+  return isQwen3EmbeddingModel(model) ? 1024 : DEFAULT_EMBEDDING_DIMENSIONS;
 }
 
 function defaultMaxTextChars(model: string): number {
-  if (model.toLowerCase() === QWEN3_EMBEDDING_MODEL.toLowerCase()) return 32000;
+  if (isQwen3EmbeddingModel(model)) return 32000;
   return model === 'text-embedding-v2' ? 1800 : 6000;
+}
+
+function isQwen3EmbeddingModel(model: string): boolean {
+  return model.toLowerCase().includes('qwen3-embedding-0.6b');
 }
 
 async function getPgPool(): Promise<PgPool> {

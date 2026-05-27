@@ -57,14 +57,14 @@ interface VectorSearchInput {
 }
 
 const require = createRequire(import.meta.url);
-const QWEN3_EMBEDDING_MODEL = 'Qwen/Qwen3-Embedding-0.6B';
+const QWEN3_EMBEDDING_MODEL = 'Qwen3-Embedding-0.6B-Q8';
 const EMBEDDING_MODEL = process.env.PGVECTOR_EMBEDDING_MODEL || 'text-embedding-3-small';
 const EMBEDDING_DIMENSIONS = Math.max(1, Number(process.env.PGVECTOR_EMBEDDING_DIMENSIONS || defaultEmbeddingDimensions(EMBEDDING_MODEL)));
 const EMBEDDING_BASE_URL = process.env.PGVECTOR_EMBEDDING_BASE_URL || process.env.OPENAI_BASE_URL || '';
 const OMIT_EMBEDDING_DIMENSIONS = process.env.PGVECTOR_OMIT_EMBEDDING_DIMENSIONS === '1';
 const EMBEDDING_INPUT_CHARS = Math.max(
   1,
-  Math.min(32768, Number(process.env.PGVECTOR_EMBEDDING_INPUT_CHARS || (EMBEDDING_MODEL === 'text-embedding-v2' ? 1800 : EMBEDDING_MODEL.toLowerCase() === QWEN3_EMBEDDING_MODEL.toLowerCase() ? 32000 : 8000))),
+  Math.min(32768, Number(process.env.PGVECTOR_EMBEDDING_INPUT_CHARS || (EMBEDDING_MODEL === 'text-embedding-v2' ? 1800 : isQwen3EmbeddingModel(EMBEDDING_MODEL) ? 32000 : 8000))),
 );
 const SOURCE_TABLE = process.env.PGVECTOR_NEWS_TABLE || 'news';
 const INDEX_TABLE = process.env.PGVECTOR_INDEX_TABLE || 'news_vector_chunks';
@@ -72,7 +72,11 @@ const INDEX_INTERVAL_MS = Math.max(60_000, Number(process.env.PGVECTOR_INDEX_INT
 const INDEX_BATCH_SIZE = Math.max(1, Math.min(500, Number(process.env.PGVECTOR_INDEX_BATCH_SIZE || 100)));
 
 function defaultEmbeddingDimensions(model: string): number {
-  return model.toLowerCase() === QWEN3_EMBEDDING_MODEL.toLowerCase() ? 1024 : 1536;
+  return isQwen3EmbeddingModel(model) ? 1024 : 1536;
+}
+
+function isQwen3EmbeddingModel(model: string): boolean {
+  return model.toLowerCase().includes('qwen3-embedding-0.6b');
 }
 
 @Injectable()
