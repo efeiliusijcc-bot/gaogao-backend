@@ -296,6 +296,9 @@ async function ensureVectorMaterialsSchema(pool: PgPool, table: string, dimensio
     ['data_source_url', 'text'],
     ['website_name', 'text'],
     ['tag', 'text'],
+    ['content', 'text'],
+    ['content_excerpt', 'text'],
+    ['embedding_text', 'text'],
     ['content_hash', 'text'],
     ['embedding_model', 'text'],
     ['embedding_dimensions', 'integer'],
@@ -389,7 +392,7 @@ async function fetchMysqlRows(args: Args, table: string, limit: number): Promise
       'entitle', ${value('entitle')},
       'ch_title', ${value('ch_title')},
       'publish_time', ${value('publish_time')},
-      'content', ${value('content', `LEFT(${mysqlIdentifier('content')}, 4000)`)},
+      'content', ${value('content', `LEFT(${mysqlIdentifier('content')}, 8000)`)},
       'data_source_url', ${value('data_source_url')},
       'website_name', ${value('website_name')},
       'summary', ${value('summary', `LEFT(${mysqlIdentifier('summary')}, 2000)`)},
@@ -491,14 +494,16 @@ async function upsertVectorMaterial(
   embedding: number[],
 ): Promise<void> {
   const embeddingValue = toVectorLiteral(embedding);
-  const vectorPlaceholder = embeddingStorage === 'vector' ? '$15::vector' : '$15';
-  const vectorColumnValue = '$16::vector';
+  const contentExcerpt = buildContentExcerpt(row.content, 1000);
+  const vectorPlaceholder = embeddingStorage === 'vector' ? '$18::vector' : '$18';
+  const vectorColumnValue = '$19::vector';
   await pool.query(
     `INSERT INTO ${qi(args.pgTable)}
       (mysql_database, mysql_table_name, mysql_id, ch_title, entitle, summary, publish_time,
-       designated_tag, data_type, data_source_url, website_name, tag, content_hash, embedding_model,
+       designated_tag, data_type, data_source_url, website_name, tag, content, content_excerpt, embedding_text,
+       content_hash, embedding_model,
        embedding, embedding_vector, embedding_dimensions, indexed_at, vector_status, error_message)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,${vectorPlaceholder},${vectorColumnValue},$17,now(),'ready',NULL)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,${vectorPlaceholder},${vectorColumnValue},$20,now(),'ready',NULL)
      ON CONFLICT (mysql_database, mysql_table_name, mysql_id, embedding_model)
      DO UPDATE SET
        ch_title = EXCLUDED.ch_title,
@@ -510,6 +515,9 @@ async function upsertVectorMaterial(
        data_source_url = EXCLUDED.data_source_url,
        website_name = EXCLUDED.website_name,
        tag = EXCLUDED.tag,
+       content = EXCLUDED.content,
+       content_excerpt = EXCLUDED.content_excerpt,
+       embedding_text = EXCLUDED.embedding_text,
        content_hash = EXCLUDED.content_hash,
        embedding = EXCLUDED.embedding,
        embedding_vector = EXCLUDED.embedding_vector,
@@ -530,7 +538,10 @@ async function upsertVectorMaterial(
       row.data_source_url || null,
       row.website_name || null,
       row.tag || null,
-      crypto.createHash('sha256').update(text).digest('hex'),
+      row.content || null,
+      contentExcerpt || null,
+      text || null,
+      crypto.createHash('sha256').update(`${text}\n${contentExcerpt}`).digest('hex'),
       args.embeddingModel,
       embeddingValue,
       embeddingValue,
@@ -541,19 +552,27 @@ async function upsertVectorMaterial(
 
 function buildEmbeddingText(row: MysqlRow, maxTextChars: number): string {
   return [
-    row.ch_title,
-    row.entitle,
-    row.website_name,
-    row.tag,
-    row.designated_tag,
-    row.summary,
-    row.content,
+    labeled('标题', row.ch_title),
+    labeled('英文标题', row.entitle),
+    labeled('来源', row.website_name),
+    labeled('标签', [row.tag, row.designated_tag].filter(Boolean).join(' ')),
+    labeled('摘要', row.summary),
+    labeled('正文摘录', buildContentExcerpt(row.content, row.summary ? 350 : 500)),
   ]
     .filter(Boolean)
     .join('\n')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, maxTextChars);
+}
+
+function labeled(label: string, value: string): string {
+  const cleaned = clean(value);
+  return cleaned ? `${label}：${cleaned}` : '';
+}
+
+function buildContentExcerpt(content: string, maxLength: number): string {
+  return clean(content).slice(0, Math.max(1, maxLength));
 }
 
 function parseDay(value: string): Date {

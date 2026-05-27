@@ -15,6 +15,8 @@ export interface VectorSourceItem {
   title: string;
   url: string;
   summary: string;
+  contentExcerpt?: string;
+  embeddingText?: string;
   websiteName: string;
   publishTime: string;
   similarity: number;
@@ -434,6 +436,8 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
       publishTime: pick('publish_time', 'published_at', 'pub_time'),
       sourceTime: pick('crawl_time', 'crawled_at', 'created_at', 'updated_at', 'inserted_at', 'publish_time'),
       content: pick('content', 'body', 'text'),
+      contentExcerpt: pick('content_excerpt', 'excerpt'),
+      embeddingText: pick('embedding_text'),
       embedding: pick('embedding'),
       embeddingVector: pick('embedding_vector'),
       embeddingModel: pick('embedding_model'),
@@ -466,6 +470,9 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
     await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS data_source_url text`);
     await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS website_name text`);
     await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS tag text`);
+    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS content text`);
+    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS content_excerpt text`);
+    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS embedding_text text`);
     await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS content_hash text`);
     await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS embedding_model text`);
     if (this.pgvectorAvailable) {
@@ -568,16 +575,20 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
 
   private rowToSource(row: Record<string, unknown>, terms: string[]): VectorSourceItem {
     const title = this.clean(String(row.ch_title || row.entitle || ''), 500);
-    const summary = this.clean(String(row.summary || ''), 1200);
+    const contentExcerpt = this.clean(String(row.content_excerpt || ''), 1200);
+    const summary = this.clean(String(row.summary || contentExcerpt || ''), 1200);
     const websiteName = this.clean(String(row.website_name || ''), 300);
     const url = this.clean(String(row.source_url || ''), 1000);
+    const embeddingText = this.clean(String(row.embedding_text || ''), 1200);
     const similarity = Math.max(0, Math.min(1, Number(row.similarity || 0)));
-    const haystack = `${title} ${summary} ${websiteName}`.toLowerCase();
+    const haystack = `${title} ${summary} ${contentExcerpt} ${embeddingText} ${websiteName}`.toLowerCase();
     const termHits = terms.filter((term) => haystack.includes(term.toLowerCase())).length;
     return {
       title,
       url,
       summary,
+      contentExcerpt,
+      embeddingText,
       websiteName,
       publishTime: this.dateString(row.publish_time),
       similarity,
@@ -618,6 +629,8 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
               ${field('ch_title', columns.chTitle)},
               ${field('entitle', columns.entitle)},
               ${field('summary', columns.summary)},
+              ${field('content_excerpt', columns.contentExcerpt)},
+              ${field('embedding_text', columns.embeddingText)},
               ${field('website_name', columns.websiteName)},
               ${columns.publishTime ? `n.${this.qi(columns.publishTime)}::timestamptz` : 'NULL::timestamptz'} AS publish_time,
               ${freshnessExpr} AS source_time,
@@ -681,6 +694,8 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
               ${field('ch_title', columns.chTitle)},
               ${field('entitle', columns.entitle)},
               ${field('summary', columns.summary)},
+              ${field('content_excerpt', columns.contentExcerpt)},
+              ${field('embedding_text', columns.embeddingText)},
               ${field('website_name', columns.websiteName)},
               ${columns.publishTime ? `n.${this.qi(columns.publishTime)}::timestamptz` : 'NULL::timestamptz'} AS publish_time,
               ${freshnessExpr} AS source_time,
