@@ -22,6 +22,7 @@ interface Args {
   embeddingModel: string;
   embeddingBaseUrl: string;
   embeddingDimensions: number;
+  omitEmbeddingDimensions: boolean;
   maxTextChars: number;
   allowMixedModels: boolean;
   dryRun: boolean;
@@ -45,6 +46,7 @@ interface MysqlRow {
 const require = createRequire(import.meta.url);
 const execFile = promisify(execFileCallback);
 const DEFAULT_EMBEDDING_DIMENSIONS = 1536;
+const QWEN3_EMBEDDING_MODEL = 'Qwen/Qwen3-Embedding-0.6B';
 
 async function main() {
   const args = await loadArgs();
@@ -55,7 +57,7 @@ async function main() {
       throw new Error('OpenAI embedding key is not configured. Set OPENAI_API_KEY or save openaiEmbeddingApiKey first.');
     }
 
-    const schema = await ensureVectorMaterialsSchema(pgPool, args.pgTable);
+    const schema = await ensureVectorMaterialsSchema(pgPool, args.pgTable, args.embeddingDimensions);
     await assertModelCompatibility(pgPool, args);
     const tables = await discoverMysqlDailyTables(args);
     if (!tables.length) {
@@ -83,7 +85,7 @@ async function main() {
 
       for (let offset = 0; offset < candidates.length; offset += args.batchSize) {
         const batch = candidates.slice(offset, offset + args.batchSize);
-        const embeddings = await embedTexts(openai, args.embeddingModel, batch.map((item) => item.text), args.embeddingDimensions);
+        const embeddings = await embedTexts(openai, args, batch.map((item) => item.text));
         for (let index = 0; index < batch.length; index += 1) {
           const item = batch[index];
           const embedding = embeddings[index];
@@ -102,7 +104,7 @@ async function main() {
     );
     console.log(JSON.stringify({
       status: args.dryRun ? 'dry_run' : 'ok',
-      mode: 'legacy_vector_materials',
+      mode: schema.pgvectorAvailable ? 'pgvector_single_table' : 'legacy_vector_materials',
       pgvectorAvailable: schema.pgvectorAvailable,
       embeddingStorage: schema.embeddingStorage,
       days: args.days,
@@ -150,8 +152,17 @@ async function loadArgs(): Promise<Args> {
     pgTable: String(parsed.pgTable || process.env.PGVECTOR_NEWS_TABLE || 'vector_materials'),
     embeddingModel: String(parsed.embeddingModel || process.env.PGVECTOR_EMBEDDING_MODEL || 'text-embedding-3-small'),
     embeddingBaseUrl: String(parsed.embeddingBaseUrl || process.env.PGVECTOR_EMBEDDING_BASE_URL || process.env.OPENAI_BASE_URL || ''),
-    embeddingDimensions: positiveInt(parsed.embeddingDimensions || process.env.PGVECTOR_EMBEDDING_DIMENSIONS, DEFAULT_EMBEDDING_DIMENSIONS, 4096),
-    maxTextChars: positiveInt(parsed.maxTextChars || process.env.VECTOR_BACKFILL_MAX_TEXT_CHARS, defaultMaxTextChars(String(parsed.embeddingModel || process.env.PGVECTOR_EMBEDDING_MODEL || 'text-embedding-3-small')), 8000),
+    embeddingDimensions: positiveInt(
+      parsed.embeddingDimensions || process.env.PGVECTOR_EMBEDDING_DIMENSIONS,
+      defaultEmbeddingDimensions(String(parsed.embeddingModel || process.env.PGVECTOR_EMBEDDING_MODEL || 'text-embedding-3-small')),
+      4096,
+    ),
+    omitEmbeddingDimensions: Boolean(parsed.omitEmbeddingDimensions || process.env.PGVECTOR_OMIT_EMBEDDING_DIMENSIONS === '1'),
+    maxTextChars: positiveInt(
+      parsed.maxTextChars || process.env.VECTOR_BACKFILL_MAX_TEXT_CHARS,
+      defaultMaxTextChars(String(parsed.embeddingModel || process.env.PGVECTOR_EMBEDDING_MODEL || 'text-embedding-3-small')),
+      32768,
+    ),
     allowMixedModels: Boolean(parsed.allowMixedModels || process.env.VECTOR_BACKFILL_ALLOW_MIXED_MODELS === '1'),
     dryRun: Boolean(parsed.dryRun || process.env.VECTOR_BACKFILL_DRY_RUN === '1'),
   };
@@ -179,7 +190,12 @@ function positiveInt(value: unknown, fallback: number, max: number): number {
   return Math.max(1, Math.min(max, Math.floor(parsed)));
 }
 
+function defaultEmbeddingDimensions(model: string): number {
+  return model.toLowerCase() === QWEN3_EMBEDDING_MODEL.toLowerCase() ? 1024 : DEFAULT_EMBEDDING_DIMENSIONS;
+}
+
 function defaultMaxTextChars(model: string): number {
+  if (model.toLowerCase() === QWEN3_EMBEDDING_MODEL.toLowerCase()) return 32000;
   return model === 'text-embedding-v2' ? 1800 : 6000;
 }
 
@@ -240,7 +256,7 @@ async function inspectMysqlEnv(container: string): Promise<Record<string, string
   return env;
 }
 
-async function ensureVectorMaterialsSchema(pool: PgPool, table: string): Promise<{ pgvectorAvailable: boolean; embeddingStorage: 'text' | 'vector'; fallbackReason: string }> {
+async function ensureVectorMaterialsSchema(pool: PgPool, table: string, dimensions: number): Promise<{ pgvectorAvailable: boolean; embeddingStorage: 'text' | 'vector'; fallbackReason: string }> {
   const available = await pool.query(`SELECT 1 FROM pg_available_extensions WHERE name = 'vector' LIMIT 1`);
   let pgvectorAvailable = Boolean(available.rows.length);
   if (pgvectorAvailable) {
@@ -282,7 +298,8 @@ async function ensureVectorMaterialsSchema(pool: PgPool, table: string): Promise
     await pool.query(`ALTER TABLE ${qi(table)} ADD COLUMN IF NOT EXISTS ${qi(name)} ${type}`);
   }
   if (pgvectorAvailable) {
-    await pool.query(`ALTER TABLE ${qi(table)} ADD COLUMN IF NOT EXISTS embedding_vector vector(1536)`);
+    await pool.query(`ALTER TABLE ${qi(table)} ADD COLUMN IF NOT EXISTS embedding_vector vector(${dimensions})`);
+    await assertEmbeddingVectorDimensions(pool, table, dimensions);
   }
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS ${qi(`${table}_mysql_source_uidx`)} ON ${qi(table)} (mysql_database, mysql_table_name, mysql_id, embedding_model)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS ${qi(`${table}_publish_time_idx`)} ON ${qi(table)} (publish_time DESC NULLS LAST)`);
@@ -309,6 +326,25 @@ async function ensureVectorMaterialsSchema(pool: PgPool, table: string): Promise
     fallbackReason = 'pgvector extension is unavailable; embeddings are stored as text in legacy_vector_materials mode';
   }
   return { pgvectorAvailable, embeddingStorage, fallbackReason };
+}
+
+async function assertEmbeddingVectorDimensions(pool: PgPool, table: string, dimensions: number): Promise<void> {
+  const result = await pool.query(
+    `SELECT format_type(a.atttypid, a.atttypmod) AS column_type
+       FROM pg_attribute a
+       JOIN pg_class c ON c.oid = a.attrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = ANY (current_schemas(false))
+        AND c.relname = $1
+        AND a.attname = 'embedding_vector'
+        AND NOT a.attisdropped
+      LIMIT 1`,
+    [table],
+  );
+  const columnType = String(result.rows[0]?.column_type || '');
+  if (columnType && !columnType.includes(`vector(${dimensions})`)) {
+    throw new Error(`Existing ${table}.embedding_vector is ${columnType}; use a separate table for ${dimensions}-dim embeddings, for example --pg-table=vector_materials_qwen3`);
+  }
 }
 
 async function discoverMysqlDailyTables(args: Args): Promise<string[]> {
@@ -406,11 +442,11 @@ async function runMysql(args: Args, sql: string): Promise<string> {
   return stdout;
 }
 
-async function embedTexts(openai: OpenAI, model: string, texts: string[], dimensions: number): Promise<number[][]> {
+async function embedTexts(openai: OpenAI, args: Args, texts: string[]): Promise<number[][]> {
   const response = await openai.embeddings.create({
-    model,
-    input: texts.map((text) => text.slice(0, 8000)),
-    ...(dimensions ? { dimensions } : {}),
+    model: args.embeddingModel,
+    input: texts.map((text) => text.slice(0, args.maxTextChars)),
+    ...(!args.omitEmbeddingDimensions && args.embeddingDimensions ? { dimensions: args.embeddingDimensions } : {}),
   });
   return response.data.map((item) => item.embedding);
 }
