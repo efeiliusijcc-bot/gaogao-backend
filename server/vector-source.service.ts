@@ -64,7 +64,7 @@ const EMBEDDING_BASE_URL = process.env.PGVECTOR_EMBEDDING_BASE_URL || process.en
 const OMIT_EMBEDDING_DIMENSIONS = process.env.PGVECTOR_OMIT_EMBEDDING_DIMENSIONS === '1';
 const EMBEDDING_INPUT_CHARS = Math.max(
   1,
-  Math.min(32768, Number(process.env.PGVECTOR_EMBEDDING_INPUT_CHARS || (EMBEDDING_MODEL === 'text-embedding-v2' ? 1800 : isQwen3EmbeddingModel(EMBEDDING_MODEL) ? 32000 : 8000))),
+  Math.min(32768, Number(process.env.PGVECTOR_EMBEDDING_INPUT_CHARS || (EMBEDDING_MODEL === 'text-embedding-v2' ? 1800 : isQwen3EmbeddingModel(EMBEDDING_MODEL) ? 600 : 8000))),
 );
 const SOURCE_TABLE = process.env.PGVECTOR_NEWS_TABLE || 'news';
 const INDEX_TABLE = process.env.PGVECTOR_INDEX_TABLE || 'news_vector_chunks';

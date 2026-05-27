@@ -23,6 +23,7 @@ interface Args {
   embeddingBaseUrl: string;
   embeddingDimensions: number;
   omitEmbeddingDimensions: boolean;
+  embeddingTimeoutMs: number;
   maxTextChars: number;
   allowMixedModels: boolean;
   dryRun: boolean;
@@ -85,7 +86,7 @@ async function main() {
 
       for (let offset = 0; offset < candidates.length; offset += args.batchSize) {
         const batch = candidates.slice(offset, offset + args.batchSize);
-        const embeddings = await embedTexts(openai, args, batch.map((item) => item.text));
+        const embeddings = await embedTextsWithFallback(openai, args, batch.map((item) => item.text));
         for (let index = 0; index < batch.length; index += 1) {
           const item = batch[index];
           const embedding = embeddings[index];
@@ -95,6 +96,9 @@ async function main() {
           }
           await upsertVectorMaterial(pgPool, args, schema.embeddingStorage, item.row, item.text, embedding);
           indexed += 1;
+          if (indexed % 50 === 0) {
+            console.error(JSON.stringify({ status: 'progress', indexed, fetched, table }));
+          }
         }
       }
     }
@@ -158,6 +162,7 @@ async function loadArgs(): Promise<Args> {
       4096,
     ),
     omitEmbeddingDimensions: Boolean(parsed.omitEmbeddingDimensions || process.env.PGVECTOR_OMIT_EMBEDDING_DIMENSIONS === '1'),
+    embeddingTimeoutMs: positiveInt(parsed.embeddingTimeoutMs || process.env.PGVECTOR_EMBEDDING_TIMEOUT_MS, 60_000, 600_000),
     maxTextChars: positiveInt(
       parsed.maxTextChars || process.env.VECTOR_BACKFILL_MAX_TEXT_CHARS,
       defaultMaxTextChars(String(parsed.embeddingModel || process.env.PGVECTOR_EMBEDDING_MODEL || 'text-embedding-3-small')),
@@ -446,12 +451,34 @@ async function runMysql(args: Args, sql: string): Promise<string> {
   return stdout;
 }
 
+async function embedTextsWithFallback(openai: OpenAI, args: Args, texts: string[]): Promise<number[][]> {
+  try {
+    return await embedTexts(openai, args, texts);
+  } catch (error) {
+    if (texts.length <= 1) {
+      console.error(JSON.stringify({ status: 'embedding_failed', error: safeError(error) }));
+      return [[]];
+    }
+    console.error(JSON.stringify({ status: 'embedding_batch_failed', batchSize: texts.length, error: safeError(error) }));
+    const embeddings: number[][] = [];
+    for (const text of texts) {
+      try {
+        embeddings.push(...await embedTexts(openai, args, [text]));
+      } catch (singleError) {
+        console.error(JSON.stringify({ status: 'embedding_failed', error: safeError(singleError) }));
+        embeddings.push([]);
+      }
+    }
+    return embeddings;
+  }
+}
+
 async function embedTexts(openai: OpenAI, args: Args, texts: string[]): Promise<number[][]> {
   const response = await openai.embeddings.create({
     model: args.embeddingModel,
     input: texts.map((text) => text.slice(0, args.maxTextChars)),
     ...(!args.omitEmbeddingDimensions && args.embeddingDimensions ? { dimensions: args.embeddingDimensions } : {}),
-  });
+  }, { timeout: args.embeddingTimeoutMs });
   return response.data.map((item) => item.embedding);
 }
 
