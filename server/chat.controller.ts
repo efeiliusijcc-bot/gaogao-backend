@@ -8,11 +8,11 @@ export class ChatController {
   constructor(private readonly chat: ChatService) {}
 
   @Post('completions')
-  completions(@Body() body: { messages?: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>; stream?: boolean }) {
+  completions(@Body() body: { messages?: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>; stream?: boolean; sessionId?: string }) {
     if (!Array.isArray(body.messages) || body.messages.length === 0) {
       throw new HttpException({ error: 'messages is required' }, HttpStatus.BAD_REQUEST);
     }
-    return this.chat.complete({ messages: body.messages, stream: body.stream });
+    return this.chat.complete({ messages: body.messages, stream: body.stream, sessionId: body.sessionId });
   }
 
   @Sse('streams/:streamId')

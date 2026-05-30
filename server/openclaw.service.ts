@@ -9,6 +9,9 @@ import {
   OPENCLAW_CONTAINER_REPORT_DIR,
   OPENCLAW_HEALTH_URL,
   OPENCLAW_MODEL,
+  OPENCLAW_QA_AGENT_ID,
+  OPENCLAW_QA_MODEL,
+  OPENCLAW_QA_TIMEOUT_MS,
   OPENCLAW_STATE_DIR,
   REPORT_TIMEOUT_MS,
 } from './config.js';
@@ -330,8 +333,59 @@ export class OpenClawService {
     messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
     onEvent: (event: ServerEvent) => void,
   ): Promise<string> {
+    return this.streamQaViaHttp(messages, onEvent);
+  }
+
+  async streamQa(
+    messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+    onEvent: (event: ServerEvent) => void,
+    sessionId?: string,
+  ): Promise<string> {
+    let keepAliveTimer: NodeJS.Timeout | undefined;
+    try {
+      onEvent({ type: 'stage', stage: 'retrieval_started', message: '正在检索数据库并整合相关信息' });
+      keepAliveTimer = setInterval(() => {
+        onEvent({ type: 'status', status: 'running', message: '正在检索数据库并整合相关信息' });
+      }, 15000);
+      keepAliveTimer.unref?.();
+
+      const payload = await this.gatewayDevice.runAgent({
+        agentId: OPENCLAW_QA_AGENT_ID,
+        message: this.buildQaGatewayMessage(messages),
+        timeoutMs: OPENCLAW_QA_TIMEOUT_MS,
+        sessionKey: this.buildQaGatewaySessionKey(sessionId),
+        label: 'knowledge-qa',
+      });
+      clearInterval(keepAliveTimer);
+      keepAliveTimer = undefined;
+
+      const text = this.extractAgentMarkdown(payload).trim();
+      const error = this.extractQaAgentError(payload, text);
+      if (error) throw new Error(error);
+      if (!text) throw new Error(`OpenClaw qa-agent returned no text. Raw payload: ${JSON.stringify(payload).slice(0, 2000)}`);
+
+      onEvent({ type: 'stage', stage: 'synthesis_started', message: '正在生成回答' });
+      for (const chunk of this.splitTextForStreaming(text)) {
+        onEvent({ type: 'text_delta', content: chunk });
+        onEvent({ type: 'token', content: chunk });
+      }
+      return text;
+    } catch (error) {
+      if (keepAliveTimer) clearInterval(keepAliveTimer);
+      console.warn(
+        `OpenClaw qa-agent Gateway call failed; falling back to HTTP model ${OPENCLAW_QA_MODEL}:`,
+        error instanceof Error ? error.message : String(error),
+      );
+      return this.streamQaViaHttp(messages, onEvent);
+    }
+  }
+
+  private async streamQaViaHttp(
+    messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+    onEvent: (event: ServerEvent) => void,
+  ): Promise<string> {
     const stream = await this.client.chat.completions.create({
-      model: OPENCLAW_MODEL,
+      model: OPENCLAW_QA_MODEL,
       messages,
       stream: true,
     });
@@ -370,6 +424,70 @@ export class OpenClawService {
     }
 
     return text.trim();
+  }
+
+  private buildQaGatewayMessage(messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]): string {
+    const transcript = messages
+      .map((message) => {
+        const role = typeof message.role === 'string' ? message.role : 'user';
+        const content = this.stringifyChatContent(message.content);
+        return `${role}: ${content}`;
+      })
+      .filter((line) => line.trim().length > 0)
+      .join('\n\n');
+
+    return [
+      '请根据以下对话回答最后一个用户问题。',
+      '要求：先检索数据库信源资料，再整合回答；如果资料不足，请明确说明当前数据库中未检索到足够信息。',
+      '直接输出最终回答，不要输出检索过程、思考过程或“我先检索”等开场白，不要中英文混杂。',
+      '回答面向普通业务用户，不要暴露底层工具、模型、SQL、MCP、Gateway 或 Agent 过程。',
+      '',
+      transcript,
+    ].join('\n');
+  }
+
+  private stringifyChatContent(content: OpenAI.Chat.Completions.ChatCompletionMessageParam['content']): string {
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+      return content
+        .map((part) => {
+          if (typeof part === 'string') return part;
+          if (part && typeof part === 'object' && 'text' in part && typeof part.text === 'string') return part.text;
+          return '';
+        })
+        .filter(Boolean)
+        .join('\n');
+    }
+    return '';
+  }
+
+  private buildQaGatewaySessionKey(sessionId?: string): string {
+    const normalized = String(sessionId || '')
+      .replace(/[^a-zA-Z0-9_.:-]/g, '_')
+      .slice(0, 120);
+    if (normalized) return `agent:${OPENCLAW_QA_AGENT_ID}:chat:${normalized}`;
+    return `agent:${OPENCLAW_QA_AGENT_ID}:chat:${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  private splitTextForStreaming(text: string): string[] {
+    const chunks = text.match(/[\s\S]{1,160}/g);
+    return chunks && chunks.length > 0 ? chunks : [text];
+  }
+
+  private extractQaAgentError(payload: unknown, text: string): string | null {
+    const root = payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {};
+    const result = root.result && typeof root.result === 'object' ? (root.result as Record<string, unknown>) : root;
+    const meta = result.meta && typeof result.meta === 'object' ? (result.meta as Record<string, unknown>) : undefined;
+    const status = typeof root.status === 'string' ? root.status : typeof result.status === 'string' ? result.status : '';
+    const stopReason = typeof meta?.stopReason === 'string' ? meta.stopReason : '';
+    const embeddedRunError = typeof meta?.embeddedRunError === 'string' ? meta.embeddedRunError : '';
+
+    if (/failed|error/i.test(status) || stopReason === 'error' || embeddedRunError) {
+      return `OpenClaw qa-agent failed: ${embeddedRunError || text.slice(0, 300) || 'empty response'}`;
+    }
+
+    const textError = this.extractTextError(text);
+    return textError ? `OpenClaw qa-agent failed: ${textError}` : null;
   }
 
   private buildReportPrompt(input: RunInput): string {

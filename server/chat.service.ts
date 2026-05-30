@@ -7,6 +7,7 @@ import type { ServerEvent } from './types.js';
 interface ChatRequest {
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
   stream?: boolean;
+  sessionId?: string;
 }
 
 @Injectable()
@@ -21,12 +22,12 @@ export class ChatService {
       const streamId = uuid();
       this.streams.set(streamId, new Subject<ServerEvent>());
       this.history.set(streamId, []);
-      setImmediate(() => void this.runStream(streamId, body.messages));
+      setImmediate(() => void this.runStream(streamId, body.messages, body.sessionId));
       return { streamId, eventsUrl: `/api/chat/streams/${streamId}` };
     }
 
     const events: ServerEvent[] = [];
-    const text = await this.openClaw.streamChat(body.messages, (event) => events.push(event));
+    const text = await this.openClaw.streamQa(body.messages, (event) => events.push(event), body.sessionId);
     return {
       choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
       events,
@@ -40,9 +41,9 @@ export class ChatService {
     };
   }
 
-  private async runStream(streamId: string, messages: ChatRequest['messages']) {
+  private async runStream(streamId: string, messages: ChatRequest['messages'], sessionId?: string) {
     try {
-      await this.openClaw.streamChat(messages, (event) => this.push(streamId, event));
+      await this.openClaw.streamQa(messages, (event) => this.push(streamId, event), sessionId);
       this.push(streamId, { type: 'done', jobId: streamId });
       this.streams.get(streamId)?.complete();
     } catch (error) {
