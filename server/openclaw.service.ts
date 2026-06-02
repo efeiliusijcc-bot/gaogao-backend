@@ -342,6 +342,21 @@ export class OpenClawService {
     sessionId?: string,
   ): Promise<string> {
     let keepAliveTimer: NodeJS.Timeout | undefined;
+    const sessionKey = this.buildQaGatewaySessionKey(sessionId);
+    const startedAt = Date.now();
+    let streamedText = '';
+    const emitText = (text: string) => {
+      const next = text.trim();
+      if (!next || next === streamedText) return;
+      const delta = next.startsWith(streamedText) ? next.slice(streamedText.length) : next;
+      streamedText = next;
+      if (!delta) return;
+      onEvent({ type: 'stage', stage: 'synthesis_started', message: '正在生成回答' });
+      for (const chunk of this.splitTextForStreaming(delta)) {
+        onEvent({ type: 'text_delta', content: chunk });
+        onEvent({ type: 'token', content: chunk });
+      }
+    };
     try {
       onEvent({ type: 'stage', stage: 'retrieval_started', message: '正在检索数据库并整合相关信息' });
       keepAliveTimer = setInterval(() => {
@@ -353,25 +368,25 @@ export class OpenClawService {
         agentId: OPENCLAW_QA_AGENT_ID,
         message: this.buildQaGatewayMessage(messages),
         timeoutMs: OPENCLAW_QA_TIMEOUT_MS,
-        sessionKey: this.buildQaGatewaySessionKey(sessionId),
+        sessionKey,
         label: 'knowledge-qa',
+        onEvent: (event) => this.forwardGatewayEvent(event, onEvent),
+        earlyResolve: () => this.waitForQaSessionAnswer(sessionKey, startedAt, messages, emitText),
       });
       clearInterval(keepAliveTimer);
       keepAliveTimer = undefined;
 
-      const text = this.extractAgentMarkdown(payload).trim();
+      const text = (this.extractAgentMarkdown(payload) || streamedText || this.extractAgentSessionFinalText(OPENCLAW_QA_AGENT_ID, sessionKey, startedAt, messages)).trim();
       const error = this.extractQaAgentError(payload, text);
       if (error) throw new Error(error);
       if (!text) throw new Error(`OpenClaw qa-agent returned no text. Raw payload: ${JSON.stringify(payload).slice(0, 2000)}`);
 
       onEvent({ type: 'stage', stage: 'synthesis_started', message: '正在生成回答' });
-      for (const chunk of this.splitTextForStreaming(text)) {
-        onEvent({ type: 'text_delta', content: chunk });
-        onEvent({ type: 'token', content: chunk });
-      }
+      emitText(text);
       return text;
     } catch (error) {
       if (keepAliveTimer) clearInterval(keepAliveTimer);
+      if (streamedText.trim()) return streamedText.trim();
       console.warn(
         `OpenClaw qa-agent Gateway call failed; falling back to HTTP model ${OPENCLAW_QA_MODEL}:`,
         error instanceof Error ? error.message : String(error),
@@ -438,6 +453,19 @@ export class OpenClawService {
 
     return [
       '请根据以下对话回答最后一个用户问题。',
+      '检索规程：必须优先使用 pg-sources__query 检索 PostgreSQL 信源库，不要先使用 MySQL；不要查询 documents、news、articles 等臆测表名。',
+      'PostgreSQL 当前主要信源表是 public.vector_materials_qwen3；如需确认结构，先查询 information_schema.columns。常用字段包括 ch_title、entitle、data_source_url、website_name、publish_time、summary、content、embedding_text、embedding_model、embedding_vector。',
+      'PG 检索时至少返回 ch_title、data_source_url、website_name、publish_time、summary；优先在 ch_title、summary、content、embedding_text 中围绕用户问题的关键词和同义词检索，并按 publish_time DESC 排序。不要使用不存在的 title、source、published_at 字段。',
+      '如果 pg-sources__query 返回空结果或表结构不满足需求，可以再用 mysql-test__mysql_query 作为补充检索；补充检索结果也必须保留 ch_title、data_source_url、website_name、publish_time、summary 等来源字段。',
+      '回答必须基于检索到的信源资料进行归纳。资料不足时，请明确说明当前信源库未检索到足够信息，不要编造细节。',
+      '直接输出最终回答，不要输出检索过程、思考过程或“我先检索”等开场白，不要中英文混杂。',
+      '回答面向普通业务用户，不要暴露底层工具、模型、SQL、MCP、Gateway 或 Agent 过程。',
+      '',
+      transcript,
+    ].join('\n');
+
+    return [
+      '请根据以下对话回答最后一个用户问题。',
       '要求：先检索数据库信源资料，再整合回答；如果资料不足，请明确说明当前数据库中未检索到足够信息。',
       '直接输出最终回答，不要输出检索过程、思考过程或“我先检索”等开场白，不要中英文混杂。',
       '回答面向普通业务用户，不要暴露底层工具、模型、SQL、MCP、Gateway 或 Agent 过程。',
@@ -469,9 +497,70 @@ export class OpenClawService {
     return `agent:${OPENCLAW_QA_AGENT_ID}:chat:${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   }
 
+  extractQaSessionSources(sessionId?: string): Record<string, unknown>[] {
+    const normalized = String(sessionId || '')
+      .replace(/[^a-zA-Z0-9_.:-]/g, '_')
+      .slice(0, 120);
+    if (!normalized) return [];
+
+    const sessionKey = `agent:${OPENCLAW_QA_AGENT_ID}:chat:${normalized}`;
+    const jsonlPath = this.resolveAgentSessionJsonlPath(OPENCLAW_QA_AGENT_ID, sessionKey);
+    if (!jsonlPath) return [];
+
+    try {
+      const sources: Record<string, unknown>[] = [];
+      const lines = fs.readFileSync(jsonlPath, 'utf8').split(/\r?\n/).filter(Boolean);
+      for (const line of lines) {
+        const item = this.parseJsonLine(line);
+        const message = item?.message && typeof item.message === 'object' ? (item.message as Record<string, unknown>) : undefined;
+        if (!message || message.role !== 'toolResult') continue;
+
+        const toolName = String(message.toolName || '');
+        if (!this.isQaSourceTool(toolName)) continue;
+
+        for (const row of this.extractSourceRowsFromToolResult(message)) {
+          const source = this.normalizeQaSourceRow(row, toolName);
+          if (source) sources.push(source);
+        }
+      }
+      return this.dedupeQaSources(sources).slice(0, 100);
+    } catch {
+      return [];
+    }
+  }
+
   private splitTextForStreaming(text: string): string[] {
     const chunks = text.match(/[\s\S]{1,160}/g);
     return chunks && chunks.length > 0 ? chunks : [text];
+  }
+
+  private async waitForQaSessionAnswer(
+    sessionKey: string,
+    startedAt: number,
+    messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+    emitText: (text: string) => void,
+  ): Promise<unknown> {
+    const deadline = startedAt + OPENCLAW_QA_TIMEOUT_MS;
+    let lastText = '';
+    let stableCount = 0;
+    while (Date.now() < deadline) {
+      await this.sleep(1000);
+      const text = this.extractAgentSessionFinalText(OPENCLAW_QA_AGENT_ID, sessionKey, startedAt, messages).trim();
+      if (!text) continue;
+      emitText(text);
+      if (text === lastText) stableCount += 1;
+      else stableCount = 0;
+      lastText = text;
+      if (stableCount >= 1) {
+        return {
+          result: {
+            payloads: [{ text }],
+            meta: { finalAssistantVisibleText: text },
+          },
+        };
+      }
+    }
+    throw new Error('OpenClaw qa-agent session answer timed out.');
   }
 
   private extractQaAgentError(payload: unknown, text: string): string | null {
@@ -850,6 +939,9 @@ export class OpenClawService {
       '17. K报正文开头必须按标准样式把导语和摘要合并为“一、基本情况”之前的一整段自然段正文；不得生成“导语”“摘要”“导语/摘要”“摘要导语”等任何小标题，也不得拆成两个独立模块。',
       '18. K report format lock: use this exact structure, without relying on any historical file path: centered bold title; two separate metadata lines **编号：**K-YYYY-MMDD-NNN and **签发日期：**YYYY年M月D日; one untitled preface paragraph; ## **一、基本情况** with exactly four fixed subheadings ### **（一）主要内容**, ### **（二）各方态度**, ### **（三）相关情况**, ### **（四）其他背景**; ## **二、涉我风险** has no subheadings and uses bold Markdown leads **一是...。**, **二是...。**, **三是...。**, **四是...。**; ## **三、对策建议** has no subheadings and uses bold Markdown leads **一是...。**, **二是...。**, **三是...。**; ## **四、参考资料** is followed by **来源可信度评估：** paragraphs and **信息缺口：** numbered list.',
       '19. selectedDirections only guide material coverage; never render selectedDirections labels such as 事件经过, 政策依据, 涉我安全利益, 风险传导路径, 风险等级判断, 立即措施, 中期措施, 预案与风险提示 as headings, subheadings, or fixed paragraph leads.',
+      `20. Internal reference artifact: after final Markdown is complete, create ${OPENCLAW_CONTAINER_REPORT_DIR}/${jobId}/references/report_references.json. It must contain every citation number used in the final report body, including citations that came from non-structured public research evidence and citations that do not match database/vector sources.`,
+      '21. The internal reference artifact JSON schema is: {"jobId":"...","updatedAt":"ISO time","sourceCount":N,"references":[{"citationNo":1,"title":"","sourceName":"","url":"","publishedAt":"","summary":"","excerpt":"","rawReferenceText":"[1] ...","sourceType":"report_reference","relevanceScore":100,"status":"referenced","method":"final_report_reference_index","matchStatus":"matched|raw_only"}]}.',
+      '22. Keep report_references.json internal only: do not mention its path, JSON schema, SQL, MCP, OpenClaw, Agent, database tables, or implementation details in the final user-visible report. The final Markdown reference section remains normal Chinese report text.',
       ...databaseSourceRequirements,
     ];
   }
@@ -1322,15 +1414,53 @@ export class OpenClawService {
   }
 
   private resolveSessionJsonlPath(sessionKey: string): string | null {
+    return this.resolveAgentSessionJsonlPath('report-agent', sessionKey);
+  }
+
+  private resolveAgentSessionJsonlPath(agentId: string, sessionKey: string): string | null {
     try {
-      const sessionsPath = path.join(OPENCLAW_STATE_DIR, 'agents', 'report-agent', 'sessions', 'sessions.json');
+      const sessionsPath = path.join(OPENCLAW_STATE_DIR, 'agents', agentId, 'sessions', 'sessions.json');
       const sessions = JSON.parse(fs.readFileSync(sessionsPath, 'utf8')) as Record<string, { sessionId?: unknown }>;
       const sessionId = sessions[sessionKey]?.sessionId;
       if (typeof sessionId !== 'string' || !sessionId) return null;
-      const jsonlPath = path.join(OPENCLAW_STATE_DIR, 'agents', 'report-agent', 'sessions', `${sessionId}.jsonl`);
+      const jsonlPath = path.join(OPENCLAW_STATE_DIR, 'agents', agentId, 'sessions', `${sessionId}.jsonl`);
       return fs.existsSync(jsonlPath) ? jsonlPath : null;
     } catch {
       return null;
+    }
+  }
+
+  private extractAgentSessionFinalText(
+    agentId: string,
+    sessionKey: string,
+    startedAt = 0,
+    messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [],
+  ): string {
+    const jsonlPath = this.resolveAgentSessionJsonlPath(agentId, sessionKey);
+    if (!jsonlPath) return '';
+
+    try {
+      const entries = fs.readFileSync(jsonlPath, 'utf8')
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .map((line) => this.parseJsonLine(line))
+        .filter((item): item is Record<string, unknown> => Boolean(item));
+      const lastUserText = this.lastUserMessageText(messages);
+      const boundary = this.findMatchingUserEntryIndex(entries, lastUserText);
+
+      for (let index = entries.length - 1; index > boundary; index -= 1) {
+        const item = entries[index];
+        const itemTime = this.readSessionItemTime(item);
+        if (startedAt && itemTime && itemTime < startedAt - 5000) continue;
+        const message = item.message && typeof item.message === 'object' ? (item.message as Record<string, unknown>) : undefined;
+        if (!message || message.role !== 'assistant') continue;
+        const text = this.extractAssistantMessageText(message);
+        if (text) return text;
+      }
+
+      return '';
+    } catch {
+      return '';
     }
   }
 
@@ -1371,6 +1501,44 @@ export class OpenClawService {
       .filter((text) => text.trim());
 
     return texts.join('\n\n').trim();
+  }
+
+  private lastUserMessageText(messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]): string {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message?.role !== 'user') continue;
+      return this.stringifyChatContent(message.content).replace(/\s+/g, ' ').trim();
+    }
+    return '';
+  }
+
+  private findMatchingUserEntryIndex(entries: Record<string, unknown>[], userText: string): number {
+    const needle = userText.slice(0, 120);
+    if (!needle) return -1;
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const item = entries[index];
+      const message = item.message && typeof item.message === 'object' ? (item.message as Record<string, unknown>) : undefined;
+      if (!message || message.role !== 'user') continue;
+      const text = this.extractAssistantMessageText(message).replace(/\s+/g, ' ').trim();
+      if (!text) continue;
+      if (text.includes(needle) || needle.includes(text.slice(0, 120))) return index;
+    }
+    return -1;
+  }
+
+  private readSessionItemTime(item: Record<string, unknown>): number {
+    const message = item.message && typeof item.message === 'object' ? (item.message as Record<string, unknown>) : {};
+    for (const source of [item, message]) {
+      for (const key of ['createdAt', 'updatedAt', 'timestamp', 'time', 'startedAt', 'endedAt']) {
+        const value = source[key];
+        if (typeof value === 'number' && Number.isFinite(value)) return value;
+        if (typeof value === 'string') {
+          const parsed = Date.parse(value);
+          if (Number.isFinite(parsed)) return parsed;
+        }
+      }
+    }
+    return 0;
   }
 
   private extractReportPathFromText(text: string): string {
@@ -1446,6 +1614,97 @@ export class OpenClawService {
         detail: summary.detail,
       },
     });
+  }
+
+  private isQaSourceTool(toolName: string): boolean {
+    return /pg-sources__query|pg_sources__query|mysql-test__mysql_query|mysql_test__mysql_query/i.test(toolName);
+  }
+
+  private extractSourceRowsFromToolResult(message: Record<string, unknown>): Record<string, unknown>[] {
+    const candidates: unknown[] = [];
+    if (Array.isArray(message.content)) {
+      for (const item of message.content) {
+        if (!item || typeof item !== 'object') continue;
+        const text = (item as Record<string, unknown>).text;
+        if (typeof text === 'string') candidates.push(this.parseMaybeJson(text));
+      }
+    }
+    if (message.details && typeof message.details === 'object') candidates.push(message.details);
+
+    const rows: Record<string, unknown>[] = [];
+    for (const candidate of candidates) {
+      rows.push(...this.arrayFromQaSourceCandidate(candidate));
+    }
+    return rows;
+  }
+
+  private parseMaybeJson(text: string): unknown {
+    const trimmed = text.trim();
+    if (!trimmed || (!trimmed.startsWith('[') && !trimmed.startsWith('{'))) return null;
+    try {
+      return JSON.parse(trimmed) as unknown;
+    } catch {
+      return null;
+    }
+  }
+
+  private arrayFromQaSourceCandidate(candidate: unknown): Record<string, unknown>[] {
+    if (Array.isArray(candidate)) {
+      return candidate.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item));
+    }
+    if (!candidate || typeof candidate !== 'object') return [];
+    const object = candidate as Record<string, unknown>;
+    for (const key of ['rows', 'sources', 'data', 'items', 'results']) {
+      const value = object[key];
+      if (Array.isArray(value)) {
+        return value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item));
+      }
+    }
+    return [];
+  }
+
+  private normalizeQaSourceRow(row: Record<string, unknown>, toolName: string): Record<string, unknown> | null {
+    const title = this.firstString(row, ['title', 'ch_title', 'headline', 'sourceTitle', 'entitle']);
+    const url = this.firstString(row, ['url', 'source_url', 'data_source_url']);
+    const summary = this.firstString(row, ['summary', 'summary_snippet', 'abstract', 'description']);
+    const sourceName = this.firstString(row, ['publisher', 'website_name', 'source_name', 'site_name']);
+    const publishTime = this.firstString(row, ['published_at', 'publish_time', 'pub_time', 'source_time']);
+    const contentExcerpt = this.firstString(row, ['excerpt', 'content_excerpt', 'chunk_text', 'content_chunk', 'content']);
+    if (!title && !url && !summary && !contentExcerpt) return null;
+    return {
+      title,
+      ch_title: title,
+      url,
+      source_url: url,
+      data_source_url: url,
+      summary,
+      excerpt: contentExcerpt,
+      content_excerpt: contentExcerpt,
+      publisher: sourceName,
+      website_name: sourceName,
+      published_at: publishTime,
+      publish_time: publishTime,
+      source_type: /pg/i.test(toolName) ? 'PG 向量信源' : '数据库信源',
+      type: /pg/i.test(toolName) ? 'PG 向量信源' : '数据库信源',
+      relevance_score: this.firstNumber(row, ['relevance_score', 'relevanceScore', 'score', 'similarity', 'rank_score']),
+      method: /pg/i.test(toolName) ? 'PG 向量语义召回' : '数据库关键词召回',
+      status: 'hit',
+    };
+  }
+
+  private dedupeQaSources(sources: Record<string, unknown>[]): Record<string, unknown>[] {
+    const seen = new Set<string>();
+    const result: Record<string, unknown>[] = [];
+    for (const source of sources) {
+      const url = this.firstString(source, ['url', 'source_url', 'data_source_url']).toLowerCase();
+      const title = this.firstString(source, ['title', 'ch_title', 'headline', 'sourceTitle']).toLowerCase();
+      const publisher = this.firstString(source, ['publisher', 'website_name', 'source_name', 'site_name']).toLowerCase();
+      const key = url || `${title}|${publisher}`;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      result.push(source);
+    }
+    return result;
   }
 
   private inferReadRangeFromToolResult(message: Record<string, unknown>): { start: number; end: number } | null {

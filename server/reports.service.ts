@@ -61,6 +61,45 @@ interface DatabaseSourcesResponse {
   vectorPlan?: VectorQueryPlanSummary;
 }
 
+type ReportSourceListType = 'all' | 'report_refs' | 'structured_sources' | 'candidate_hits' | 'extract_failed';
+
+interface ReportSourcesOptions {
+  type?: string;
+  page?: string | number;
+  pageSize?: string | number;
+}
+
+interface ReportSourceListItem {
+  id: string;
+  sourceGroup: Exclude<ReportSourceListType, 'all'>;
+  citationNo?: number;
+  title: string;
+  url?: string;
+  sourceName?: string;
+  publishTime?: string;
+  summary?: string;
+  excerpt?: string;
+  sourceType?: string;
+  relevanceScore?: number;
+  status?: string;
+  method?: string;
+  failedReason?: string;
+  rawReferenceText?: string;
+  matchStatus?: 'matched' | 'raw_only' | 'failed';
+  candidateStage?: string;
+  hitType?: string;
+}
+
+interface ReportSourcesResponse {
+  items: ReportSourceListItem[];
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  hasMore: boolean;
+  meta?: Record<string, unknown>;
+}
+
 @Injectable()
 export class ReportsService {
   private readonly jobs = new Map<string, JobRecord>();
@@ -130,6 +169,13 @@ export class ReportsService {
 
   getJob(jobId: string): JobRecord | undefined {
     return this.jobs.get(jobId);
+  }
+
+  async getJobWithRecoveredReport(jobId: string): Promise<JobRecord | undefined> {
+    const job = this.jobs.get(jobId);
+    if (!job) return undefined;
+    await this.recoverJobFromExistingReport(job, 'detail_lookup');
+    return job;
   }
 
   getStream(jobId: string): Subject<ServerEvent> | undefined {
@@ -213,6 +259,7 @@ export class ReportsService {
   async getResultFromDisk(jobId: string) {
     const job = this.jobs.get(jobId);
     if (!job) return undefined;
+    await this.recoverJobFromExistingReport(job, 'result_lookup');
     if (job.status !== 'succeeded') return null;
 
     const reportDir = this.remoteFs.remoteDir;
@@ -251,6 +298,7 @@ export class ReportsService {
   async getMarkdownFromDisk(jobId: string) {
     const job = this.jobs.get(jobId);
     if (!job) return undefined;
+    await this.recoverJobFromExistingReport(job, 'download_lookup');
     if (job.status !== 'succeeded' || !job.resultPath) return null;
 
     const markdown = await this.remoteFs.readFile(job.resultPath);
@@ -337,6 +385,52 @@ export class ReportsService {
         : 'keyword';
 
     return { status, sources, fallbackReason, totalHits, updatedAt, queryPlan, retrievalMode, vectorPlan };
+  }
+
+  async getSources(jobId: string, options: ReportSourcesOptions = {}): Promise<ReportSourcesResponse | undefined> {
+    const job = this.jobs.get(jobId);
+    if (!job) return undefined;
+
+    const type = this.normalizeReportSourceType(options.type);
+    const page = this.parsePositiveInt(options.page, 1);
+    const pageSize = Math.min(this.parsePositiveInt(options.pageSize, 10), 100);
+
+    const [reportRefs, structuredSources, candidateResult, extractFailed] = await Promise.all([
+      type === 'all' || type === 'report_refs' ? this.reportReferenceSources(job) : Promise.resolve([]),
+      type === 'all' || type === 'structured_sources' ? this.structuredReportSources(job) : Promise.resolve([]),
+      type === 'all' || type === 'candidate_hits' ? this.candidateHitSources(job) : Promise.resolve({ items: [], total: 0, detailSaved: false }),
+      type === 'all' || type === 'extract_failed' ? this.extractFailedSources(job) : Promise.resolve([]),
+    ]);
+
+    const groups: Record<Exclude<ReportSourceListType, 'all'>, ReportSourceListItem[]> = {
+      report_refs: reportRefs,
+      structured_sources: structuredSources,
+      candidate_hits: candidateResult.items,
+      extract_failed: extractFailed,
+    };
+    const allItems = type === 'all' ? Object.values(groups).flat() : groups[type] || [];
+    const total = type === 'candidate_hits'
+      ? (candidateResult.total || allItems.length)
+      : allItems.length;
+    const start = (page - 1) * pageSize;
+    const items = allItems.slice(start, start + pageSize);
+
+    return {
+      items,
+      total,
+      page,
+      pageSize,
+      totalPages: Math.max(1, Math.ceil(total / pageSize)),
+      hasMore: start + items.length < total && allItems.length > start + items.length,
+      meta: type === 'candidate_hits'
+        ? {
+            detailSaved: candidateResult.detailSaved,
+            message: candidateResult.detailSaved
+              ? ''
+              : `候选池共 ${total} 条，当前历史任务未保存候选明细。`,
+          }
+        : undefined,
+    };
   }
 
   private async enrichPayloadWithVectorSources(job: JobRecord): Promise<Record<string, unknown>> {
@@ -471,8 +565,9 @@ export class ReportsService {
       const usableMarkdown = resolvedReport?.markdown ?? finalMarkdown;
       job.status = 'succeeded';
       job.markdown = usableMarkdown;
-      job.artifacts = result.artifacts;
+      job.artifacts = { ...job.artifacts, ...result.artifacts };
       job.resultPath = resolvedReport?.filePath ?? (await this.writeReportFile(job, job.markdown));
+      await this.writeReportReferencesArtifact(job, usableMarkdown);
       job.updatedAt = new Date().toISOString();
       await this.writeJobState(job);
       this.pushEvent(job, { type: 'stage', stage: 'done', message: 'Report generation completed and saved to disk.' });
@@ -501,6 +596,13 @@ export class ReportsService {
       }
 
       const message = error instanceof Error ? error.message : String(error);
+      const recovered = await this.recoverJobFromExistingReport(job, 'failure_handler');
+      if (recovered) {
+        this.pushEvent(job, { type: 'done', jobId: job.jobId });
+        this.streams.get(job.jobId)?.complete();
+        return;
+      }
+
       job.status = 'failed';
       job.stage = 'failed';
       job.errorMessage = message;
@@ -961,6 +1063,30 @@ export class ReportsService {
     return null;
   }
 
+  private async recoverJobFromExistingReport(job: JobRecord, reason: string): Promise<boolean> {
+    if (job.status === 'succeeded' && job.resultPath && job.markdown) return false;
+
+    const report = await this.findMarkdownFileInJobDir(job.jobId) ?? await this.findBestMarkdownFileForJob(job);
+    if (!report) return false;
+
+    job.status = 'succeeded';
+    job.stage = 'done';
+    job.markdown = report.markdown;
+    job.resultPath = report.filePath;
+    job.errorMessage = undefined;
+    await this.writeReportReferencesArtifact(job, report.markdown);
+    job.updatedAt = new Date().toISOString();
+
+    this.pushEvent(job, {
+      type: 'stage',
+      stage: 'report_file_recovered',
+      message: `Recovered generated report file during ${reason}: ${report.filePath}`,
+    });
+    this.pushEvent(job, { type: 'stage', stage: 'done', message: 'Report generation completed and saved to disk.' });
+    await this.writeJobState(job);
+    return true;
+  }
+
   private async findBestMarkdownFileForJob(job: JobRecord) {
     try {
       const startedAtMs = new Date(job.createdAt).getTime();
@@ -1041,6 +1167,403 @@ export class ReportsService {
         websiteName: this.sanitizeLogText(this.firstString(source, ['website_name', 'websiteName']), 120),
         publishTime: this.sanitizeLogText(this.firstString(source, ['publish_time', 'publishTime']), 60),
       });
+    }
+    return result;
+  }
+
+  private normalizeReportSourceType(type: unknown): ReportSourceListType {
+    const normalized = String(type || '').trim();
+    if (
+      normalized === 'report_refs' ||
+      normalized === 'structured_sources' ||
+      normalized === 'candidate_hits' ||
+      normalized === 'extract_failed' ||
+      normalized === 'all'
+    ) {
+      return normalized;
+    }
+    return 'report_refs';
+  }
+
+  private async reportReferenceSources(job: JobRecord): Promise<ReportSourceListItem[]> {
+    const persisted = await this.readReportReferencesArtifact(job);
+    if (persisted?.length) return persisted;
+
+    const markdown = await this.reportMarkdown(job);
+    if (!markdown) return [];
+    const rebuilt = await this.buildReportReferenceItems(job, markdown);
+    await this.writeReportReferencesArtifact(job, markdown, rebuilt);
+    return rebuilt;
+  }
+
+  private async buildReportReferenceItems(job: JobRecord, markdown: string): Promise<ReportSourceListItem[]> {
+    const references = this.parseReferenceEntriesRobust(markdown);
+    const citationNumbers = this.parseCitationNumbers(markdown);
+    const structured = await this.structuredReportSources(job);
+    const allNumbers = citationNumbers.length
+      ? citationNumbers
+      : Array.from(references.keys()).sort((a, b) => a - b);
+
+    return allNumbers.map((number, index) => {
+      const reference = references.get(number);
+      const fallback = structured[number - 1];
+      const rawReferenceText = reference?.rawReferenceText || reference?.summary || reference?.title || '';
+      const matched = Boolean(fallback?.title || fallback?.url || fallback?.summary);
+      return {
+        id: `report-ref-${number}`,
+        sourceGroup: 'report_refs',
+        citationNo: number,
+        title: reference?.title || fallback?.title || `\u53c2\u8003\u7f16\u53f7 [${number}]`,
+        url: reference?.url || fallback?.url || '',
+        sourceName: reference?.sourceName || fallback?.sourceName || '',
+        publishTime: reference?.publishTime || fallback?.publishTime || '',
+        summary: reference?.summary || fallback?.summary || rawReferenceText,
+        excerpt: `\u6b63\u6587\u5f15\u7528\u7f16\u53f7 [${number}]`,
+        sourceType: '\u62a5\u544a\u5f15\u7528',
+        relevanceScore: Math.max(100 - index, 1),
+        status: 'referenced',
+        method: reference ? '\u62a5\u544a\u53c2\u8003\u8d44\u6599\u7d22\u5f15' : matched ? '\u7ed3\u6784\u5316\u4fe1\u6e90\u5339\u914d' : '\u6b63\u6587\u5f15\u7528\u7f16\u53f7',
+        rawReferenceText,
+        matchStatus: matched ? 'matched' : 'raw_only',
+      };
+    });
+  }
+
+  private reportReferencesArtifactPath(job: JobRecord): string {
+    return this.remoteFs.joinPath(this.remoteFs.remoteDir, job.jobId, 'references', 'report_references.json');
+  }
+
+  private async reportReferencesArtifactCandidatePaths(job: JobRecord): Promise<string[]> {
+    const paths = new Set<string>();
+    const knownPath = this.firstString(job.artifacts || {}, ['reportReferencesPath', 'report_references_path']);
+    if (knownPath) paths.add(knownPath);
+    const dir = await this.resolveOpenClawJobDir(job);
+    if (dir) paths.add(this.remoteFs.joinPath(dir, 'references', 'report_references.json'));
+    paths.add(this.reportReferencesArtifactPath(job));
+    return Array.from(paths);
+  }
+
+  private async readReportReferencesArtifact(job: JobRecord): Promise<ReportSourceListItem[] | null> {
+    const paths = await this.reportReferencesArtifactCandidatePaths(job);
+    for (const filePath of paths) {
+      const raw = await this.readJsonFile(filePath);
+      if (!raw) continue;
+      const items = Array.isArray(raw)
+        ? raw
+        : this.arrayFromObject(raw, ['references', 'items', 'sources', 'data']);
+      const normalized = items
+        .map((item, index) => this.normalizeReportReferenceArtifactItem(item, index))
+        .filter((item): item is ReportSourceListItem => Boolean(item));
+      if (normalized.length) return normalized;
+    }
+    return null;
+  }
+
+  private normalizeReportReferenceArtifactItem(item: unknown, index: number): ReportSourceListItem | null {
+    if (!item || typeof item !== 'object') return null;
+    const source = item as Record<string, unknown>;
+    const citationNo = this.firstNumber(source, ['citationNo', 'citation_no', 'number', 'refNo', 'ref_no']) ?? index + 1;
+    const normalized = this.normalizeSourceRecord(source, index, 'report_refs');
+    const title = this.sanitizeLogText(
+      this.firstString(source, ['title', 'ch_title', 'headline', 'sourceTitle']) ||
+        this.firstString(source, ['rawReferenceText', 'raw_reference_text', 'referenceText', 'reference_text']) ||
+        `\u53c2\u8003\u7f16\u53f7 [${citationNo}]`,
+      220,
+    );
+    const rawReferenceText = this.sanitizeLogText(
+      this.firstString(source, ['rawReferenceText', 'raw_reference_text', 'referenceText', 'reference_text']),
+      1200,
+    );
+    const status = this.firstString(source, ['matchStatus', 'match_status']);
+    return {
+      ...normalized,
+      id: this.sanitizeLogText(normalized.id || `report-ref-${citationNo}`, 260),
+      sourceGroup: 'report_refs',
+      citationNo,
+      title,
+      sourceType: normalized.sourceType || '\u62a5\u544a\u5f15\u7528',
+      relevanceScore: normalized.relevanceScore ?? Math.max(100 - index, 1),
+      status: normalized.status || 'referenced',
+      method: normalized.method || '\u62a5\u544a\u53c2\u8003\u8d44\u6599\u7d22\u5f15',
+      rawReferenceText,
+      matchStatus: status === 'matched' || status === 'failed' || status === 'raw_only'
+        ? status
+        : rawReferenceText
+          ? 'raw_only'
+          : 'matched',
+    };
+  }
+
+  private async writeReportReferencesArtifact(
+    job: JobRecord,
+    markdown: string,
+    prebuiltItems?: ReportSourceListItem[],
+  ): Promise<void> {
+    try {
+      const items = prebuiltItems ?? await this.buildReportReferenceItems(job, markdown);
+      const references = items.slice(0, 300).map((item) => ({
+        citationNo: item.citationNo,
+        title: item.title || '',
+        sourceName: item.sourceName || '',
+        url: item.url || '',
+        publishedAt: item.publishTime || '',
+        summary: item.summary || '',
+        excerpt: item.excerpt || '',
+        rawReferenceText: item.rawReferenceText || '',
+        sourceType: item.sourceType || '',
+        relevanceScore: item.relevanceScore,
+        status: item.status || '',
+        method: item.method || '',
+        matchStatus: item.matchStatus || 'raw_only',
+      }));
+      const filePath = this.reportReferencesArtifactPath(job);
+      const dirPath = this.remoteFs.joinPath(this.remoteFs.remoteDir, job.jobId, 'references');
+      await this.remoteFs.mkdir(dirPath);
+      await this.remoteFs.writeFile(
+        filePath,
+        JSON.stringify({
+          jobId: job.jobId,
+          updatedAt: new Date().toISOString(),
+          sourceCount: references.length,
+          references,
+        }, null, 2),
+      );
+      job.artifacts = {
+        ...job.artifacts,
+        reportReferencesPath: filePath,
+        reportReferencesCount: references.length,
+      };
+    } catch (err) {
+      console.error('writeReportReferencesArtifact failed:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  private parseReferenceEntriesRobust(markdown: string): Map<number, Partial<ReportSourceListItem>> {
+    const refs = new Map<number, Partial<ReportSourceListItem>>();
+    const refsStart = this.findReferenceSectionStart(markdown);
+    if (refsStart < 0) return refs;
+    const refText = markdown.slice(refsStart);
+    const regex = /(?:^|\n)\s*(?:\[(\d{1,3})\]|(\d{1,3})[\u3001.\uff0e])\s*([\s\S]*?)(?=\n\s*(?:\[\d{1,3}\]|\d{1,3}[\u3001.\uff0e])\s*|$)/g;
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(refText)) !== null) {
+      const number = Number(match[1] || match[2]);
+      const entry = String(match[3] || '').replace(/\s+/g, ' ').trim();
+      if (!number || !entry) continue;
+      const url = entry.match(/https?:\/\/\S+/)?.[0]?.replace(/[),.;\uff0c\u3002\uff1b\uff09]+$/g, '') || '';
+      const title = url ? entry.replace(url, '').trim() : entry;
+      refs.set(number, {
+        title: this.sanitizeLogText(title || entry, 220),
+        url: this.sanitizeLogText(url, 500),
+        summary: this.sanitizeLogText(entry, 800),
+        rawReferenceText: this.sanitizeLogText(entry, 1200),
+      });
+    }
+    return refs;
+  }
+
+  private findReferenceSectionStart(markdown: string): number {
+    return markdown.search(
+      /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?\s*(?:[\u4e00-\u9fa5]+[\u3001.\uff0e]\s*)?(?:\u53c2\u8003\u6587\u732e|\u53c2\u8003\u8d44\u6599|references)(?:\*\*)?\s*[:\uff1a]?\s*(?:\n|$)/iu,
+    );
+  }
+
+  private async structuredReportSources(job: JobRecord): Promise<ReportSourceListItem[]> {
+    const data = await this.getDatabaseSources(job.jobId);
+    return (data?.sources || []).map((source, index) => ({
+      id: `structured-${source.url || source.title || index}`,
+      sourceGroup: 'structured_sources',
+      title: source.title || source.url || '未命名信源',
+      url: source.url || '',
+      sourceName: source.websiteName || '',
+      publishTime: source.publishTime || '',
+      summary: source.summary || '',
+      excerpt: '',
+      sourceType: data?.retrievalMode === 'vector' ? '向量召回' : data?.retrievalMode === 'hybrid' ? '混合召回' : '数据库记录',
+      relevanceScore: Math.max(95 - index, 1),
+      status: 'structured',
+      method: data?.retrievalMode === 'vector' ? '向量透明展示' : data?.retrievalMode === 'hybrid' ? '数据库/向量透明展示' : '数据库透明展示',
+    }));
+  }
+
+  private async candidateHitSources(job: JobRecord): Promise<{ items: ReportSourceListItem[]; total: number; detailSaved: boolean }> {
+    const data = await this.getDatabaseSources(job.jobId);
+    const total = this.candidateHitTotal(data);
+    const rawItems = await this.readCandidateSourceItems(job);
+    const items = rawItems.map((item, index) => this.normalizeCandidateSourceItem(item, index));
+    return {
+      items,
+      total: total || items.length,
+      detailSaved: items.length > 0,
+    };
+  }
+
+  private async extractFailedSources(job: JobRecord): Promise<ReportSourceListItem[]> {
+    const dir = await this.resolveOpenClawJobDir(job);
+    if (!dir) return [];
+    const sourcesPath = this.remoteFs.joinPath(dir, 'database', 'database_sources.json');
+    const raw = await this.readJsonFile(sourcesPath);
+    const items = Array.isArray(raw) ? raw : this.arrayFromObject(raw, ['items', 'sources', 'results', 'data']);
+    return items
+      .filter((item) => {
+        const source = item && typeof item === 'object' ? item as Record<string, unknown> : {};
+        const text = `${this.firstString(source, ['status', 'extract_status', 'source_status'])} ${this.firstString(source, ['error', 'message', 'failure_reason', 'failedReason'])}`;
+        return /fail|error|失败|错误|不可用/i.test(text);
+      })
+      .map((item, index) => {
+        const source = item as Record<string, unknown>;
+        const normalized = this.normalizeSourceRecord(source, index, 'extract_failed');
+        return {
+          ...normalized,
+          status: 'failed',
+          failedReason: this.firstString(source, ['failure_reason', 'failedReason', 'error', 'message']),
+          sourceType: normalized.sourceType || '抽取失败',
+        };
+      });
+  }
+
+  private candidateHitTotal(data: DatabaseSourcesResponse | undefined): number {
+    const queryPlanTotal = (data?.queryPlan.strictHits || 0) + (data?.queryPlan.expandedHits || 0);
+    const vectorTotal = data?.vectorPlan?.vectorHits || 0;
+    return Math.max(data?.totalHits || 0, queryPlanTotal + vectorTotal);
+  }
+
+  private async readCandidateSourceItems(job: JobRecord): Promise<unknown[]> {
+    const artifactItems = this.arrayFromObject(job.artifacts, [
+      'candidateSources',
+      'candidate_hits',
+      'candidateHits',
+      'retrievalHits',
+      'vectorDatabaseCandidateSources',
+    ]);
+    const fileItems: unknown[] = [];
+    const dir = await this.resolveOpenClawJobDir(job);
+    if (dir) {
+      const databaseDir = this.remoteFs.joinPath(dir, 'database');
+      for (const filename of ['database_candidate_sources.json', 'candidate_sources.json', 'retrieval_hits.json']) {
+        const parsed = await this.readJsonFile(this.remoteFs.joinPath(databaseDir, filename));
+        if (Array.isArray(parsed)) fileItems.push(...parsed);
+        else fileItems.push(...this.arrayFromObject(parsed, ['items', 'sources', 'results', 'data', 'hits', 'candidates']));
+      }
+      const plan = await this.readJsonFile(this.remoteFs.joinPath(databaseDir, 'database_query_plan.json'));
+      fileItems.push(...this.arrayFromObject(plan, [
+        'candidateSources',
+        'candidate_sources',
+        'candidateHits',
+        'candidate_hits',
+        'retrievalHits',
+        'retrieval_hits',
+        'hits',
+        'candidates',
+      ]));
+    }
+    return this.dedupeRawSources([...fileItems, ...artifactItems]);
+  }
+
+  private normalizeCandidateSourceItem(item: unknown, index: number): ReportSourceListItem {
+    const source = item && typeof item === 'object' ? item as Record<string, unknown> : {};
+    const normalized = this.normalizeSourceRecord(source, index, 'candidate_hits');
+    return {
+      ...normalized,
+      sourceType: normalized.sourceType || '候选命中',
+      relevanceScore: this.firstNumber(source, ['relevance_score', 'relevanceScore', 'score', 'similarity', 'rank_score']) ?? normalized.relevanceScore,
+      status: this.firstString(source, ['status', 'source_status']) || 'candidate',
+      method: this.firstString(source, ['method', 'retrievalMode', 'collection_method']) || '检索阶段候选池',
+      candidateStage: this.firstString(source, ['candidateStage', 'candidate_stage', 'stage']),
+      hitType: this.firstString(source, ['hitType', 'hit_type', 'type']),
+    };
+  }
+
+  private normalizeSourceRecord(source: Record<string, unknown>, index: number, sourceGroup: Exclude<ReportSourceListType, 'all'>): ReportSourceListItem {
+    const title = this.firstString(source, ['title', 'ch_title', 'headline', 'sourceTitle', 'name']);
+    const url = this.firstString(source, ['url', 'source_url', 'data_source_url', 'sourceUrl']);
+    const sourceName = this.firstString(source, ['publisher', 'website_name', 'source_name', 'site_name', 'sourceName', 'websiteName']);
+    const publishTime = this.firstString(source, ['published_at', 'publish_time', 'pub_time', 'source_time', 'publishTime', 'publishedAt', 'time']);
+    const summary = this.firstString(source, ['summary', 'abstract', 'description']);
+    const excerpt = this.firstString(source, ['excerpt', 'content_excerpt', 'chunk_text', 'content_chunk', 'body', 'content']);
+    const sourceType = this.firstString(source, ['source_type', 'type', 'tag', 'designated_tag', 'sourceType']);
+    const score = this.firstNumber(source, ['relevance_score', 'relevanceScore', 'score', 'similarity', 'rank_score']);
+    const id = this.firstString(source, ['id', 'sourceId', 'source_id', 'mysql_id']) || `${sourceGroup}-${url || title || index}`;
+    return {
+      id: this.sanitizeLogText(id, 260),
+      sourceGroup,
+      title: this.sanitizeLogText(title || url || '未命名信源', 220),
+      url: this.sanitizeLogText(url, 500),
+      sourceName: this.sanitizeLogText(sourceName, 140),
+      publishTime: this.sanitizeLogText(publishTime, 80),
+      summary: this.sanitizeLogText(summary, 1200),
+      excerpt: this.sanitizeLogText(excerpt, 1200),
+      sourceType: this.sanitizeLogText(sourceType, 80),
+      relevanceScore: score,
+      status: this.sanitizeLogText(this.firstString(source, ['status', 'extract_status', 'source_status']), 80),
+      method: this.sanitizeLogText(this.firstString(source, ['method', 'retrievalMode', 'collection_method']), 120),
+    };
+  }
+
+  private async reportMarkdown(job: JobRecord): Promise<string> {
+    if (job.markdown) return job.markdown;
+    const recovered = await this.readMarkdownFile(job.resultPath || null);
+    return recovered?.markdown || '';
+  }
+
+  private parseCitationNumbers(markdown: string): number[] {
+    const refsStart = this.findReferenceSectionStart(markdown);
+    const body = refsStart >= 0 ? markdown.slice(0, refsStart) : markdown;
+    const seen = new Set<number>();
+    const numbers: number[] = [];
+    const regex = /\[(\d{1,3})\]/g;
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(body)) !== null) {
+      const number = Number(match[1]);
+      if (!number || seen.has(number)) continue;
+      seen.add(number);
+      numbers.push(number);
+    }
+    return numbers.sort((a, b) => a - b);
+  }
+
+  private parseReferenceEntries(markdown: string): Map<number, Partial<ReportSourceListItem>> {
+    const refs = new Map<number, Partial<ReportSourceListItem>>();
+    const refsStart = this.findReferenceSectionStart(markdown);
+    if (refsStart < 0) return refs;
+    const refText = markdown.slice(refsStart);
+    const regex = /\[(\d{1,3})\]\s*([\s\S]*?)(?=\n\s*\[\d{1,3}\]\s*|$)/g;
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(refText)) !== null) {
+      const number = Number(match[1]);
+      const entry = String(match[2] || '').replace(/\s+/g, ' ').trim();
+      if (!number || !entry) continue;
+      const url = entry.match(/https?:\/\/\S+/)?.[0]?.replace(/[),.;，。；）]+$/g, '') || '';
+      const title = url ? entry.replace(url, '').trim() : entry;
+      refs.set(number, {
+        title: this.sanitizeLogText(title || entry, 220),
+        url: this.sanitizeLogText(url, 500),
+        summary: this.sanitizeLogText(entry, 800),
+      });
+    }
+    return refs;
+  }
+
+  private arrayFromObject(value: unknown, keys: string[]): unknown[] {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+    const record = value as Record<string, unknown>;
+    for (const key of keys) {
+      const candidate = record[key];
+      if (Array.isArray(candidate)) return candidate;
+    }
+    return [];
+  }
+
+  private dedupeRawSources(items: unknown[]): unknown[] {
+    const seen = new Set<string>();
+    const result: unknown[] = [];
+    for (const item of items) {
+      if (!item || typeof item !== 'object') continue;
+      const source = item as Record<string, unknown>;
+      const key = this.firstString(source, ['url', 'source_url', 'data_source_url']) ||
+        `${this.firstString(source, ['title', 'ch_title', 'headline'])}|${this.firstString(source, ['summary', 'abstract', 'description'])}`;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      result.push(item);
     }
     return result;
   }
