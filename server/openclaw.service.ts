@@ -709,7 +709,9 @@ export class OpenClawService {
     lookbackDays: number;
     maxMetadataRows: number;
     maxContentRows: number;
-    mcpServer: 'mysql-test';
+    mcpServer: 'pg-sources';
+    storageMode: 'pgvector_single_table';
+    sourceTable: 'vector_materials_qwen3';
   } {
     const options = value && typeof value === 'object' && !Array.isArray(value)
       ? (value as Record<string, unknown>)
@@ -726,7 +728,9 @@ export class OpenClawService {
       lookbackDays: boundedInt(options.lookbackDays, 30, 1, 90),
       maxMetadataRows: boundedInt(options.maxMetadataRows, 50, 1, 100),
       maxContentRows: boundedInt(options.maxContentRows, 8, 0, 20),
-      mcpServer: 'mysql-test',
+      mcpServer: 'pg-sources',
+      storageMode: 'pgvector_single_table',
+      sourceTable: 'vector_materials_qwen3',
     };
   }
 
@@ -902,33 +906,32 @@ export class OpenClawService {
     const databaseSourceOptions = this.normalizeDatabaseSourceOptions(parsedContext?.databaseSourceOptions);
     const databaseSourceRequirements = databaseSourceOptions.enabled
       ? [
-          `18. databaseSourceOptions.enabled=true 时，Research Phase 必须先读取 context.json.databaseQueryIntent 分词词包，再在公开检索前调用 MCP 工具 mysql-test__mysql_query 检索数据库历史爬取信源；配置为 summary_first、lookbackDays=${databaseSourceOptions.lookbackDays}、maxMetadataRows=${databaseSourceOptions.maxMetadataRows}、maxContentRows=${databaseSourceOptions.maxContentRows}。`,
-          '19. 数据库检索必须只使用只读 SELECT；先查 DATABASE() 和 information_schema，找出近 30 天内命名为 data_YYYYMMDD 且包含 data_source_url、ch_title、entitle、summary、tag、designated_tag、publish_time、website_name 字段的表；不得执行 INSERT/UPDATE/DELETE/DDL。',
-          '20. 数据库首轮检索只允许读取 data_source_url、ch_title、entitle、summary、tag、designated_tag、publish_time、website_name；优先使用 databaseQueryIntent.primaryPhrases、entityTerms、actionTerms、domainTerms、ngrams 组织检索条件，跨标题、摘要、标签检索；URL 去重并按完整主题短语、实体词、动作词、领域词、标题/标签/摘要命中和表日期/发布时间排序。',
-          `21. 仅当表存在 content 字段时，才可对最多 ${databaseSourceOptions.maxContentRows} 条高相关记录读取 content 作为补充；严禁读取 raw_data 字段，任何 SQL 都不得包含 raw_data。`,
-          '22. 数据库命中结果必须单独保存为 database/database_sources.json 和 database/database_query_plan.json。database_sources.json 每条记录必须保留原始展示字段：ch_title（中文标题）、data_source_url（信源链接）、summary（摘要）、website_name（来源站点名称）、publish_time（发布时间）；可附带内部字段如 tag、relevance_reason、needs_verification 等。database_query_plan 记录使用的词包、命中表、命中数量 total_hits/relevant_hits 和回退原因 database_source_fallback_reason。数据库信源只能作为增量信源，与 Tavily/Exa/Firecrawl 三件套结果合并交叉核验后再写作。',
-          '23. 如果数据库 MCP 查询失败、无表、无命中、SQL 报错或权限不足，必须在 database_query_plan.json 中写入 database_source_fallback_reason 字段（值为字符串，说明具体回退原因），然后继续执行 harness_cli.py plan/run、Tavily、Exa、Firecrawl 和公开检索，不得让编报任务失败，也不得因此缩减公网调研流程。',
+          `18. databaseSourceOptions.enabled=true 时，Research Phase 必须先读取 context.json.databaseQueryIntent 分词词包，再在公开检索前调用 MCP 工具 pg-sources__query 检索 PostgreSQL 向量信源库；配置为 summary_first、storageMode=${databaseSourceOptions.storageMode}、sourceTable=public.${databaseSourceOptions.sourceTable}、lookbackDays=${databaseSourceOptions.lookbackDays}、maxMetadataRows=${databaseSourceOptions.maxMetadataRows}、maxContentRows=${databaseSourceOptions.maxContentRows}。`,
+          '19. PG 信源库当前主表是 public.vector_materials_qwen3；如需确认结构，只能先查询 information_schema.columns。不要查询 documents、news、articles 或 news.data_YYYYMMDD 等臆测表名，不要把 MySQL 当作默认入口；任何数据库操作都必须是只读 SELECT，不得执行 INSERT/UPDATE/DELETE/DDL。',
+          '20. PG 首轮检索必须围绕 databaseQueryIntent.primaryPhrases、entityTerms、actionTerms、domainTerms、ngrams，在 ch_title、entitle、summary、content、embedding_text 中组织关键词、同义词和语义召回；优先返回 ch_title、entitle、data_source_url、website_name、publish_time、summary，可在内部读取有限 content/embedding_text 摘要用于相关性判断；严禁读取或输出 embedding_vector、raw_data、连接信息。',
+          `21. PG 命中结果必须单独保存为 database/database_sources.json 和 database/database_query_plan.json。database_sources.json 每条记录必须保留原始展示字段：ch_title（中文标题）、data_source_url（信源链接）、summary（摘要）、website_name（来源站点名称）、publish_time（发布时间）；可附带内部字段如 relevance_score、similarity、relevance_reason、needs_verification、source_type='pg_vector'。database_query_plan 必须记录 retrieval_mode='pg_vector'、mcp_server='pg-sources'、storageMode、sourceTable、embeddingModel（如可得）、indexedRows（如可得）、vector_hits/total_hits、returned_sources、使用词包和 database_source_fallback_reason。`,
+          '22. 如果 pg-sources__query 返回空结果、表结构不满足需求、SQL 报错或权限不足，必须在 database_query_plan.json 中写入 database_source_fallback_reason 字段（值为字符串，说明具体回退原因）；只有在该字段已记录后，才可用 mysql-test__mysql_query 作为补充兜底检索，并在 plan 中记录 fallback_mcp="mysql-test"。无论是否回退，都不得让编报任务失败，也不得因此缩减公网调研流程。',
+          '23. 数据库/向量信源是前置可信素材池，必须与 Tavily/Exa/Firecrawl 三件套结果合并并交叉核验后再写作；不得在最终报告正文或用户可见日志中暴露 SQL、表名、MCP 实现细节、数据库连接信息、完整 content、raw_data、embedding_text 或 embedding_vector。',
         ]
       : [
-          '18. databaseSourceOptions.enabled 不是 true 时，不得调用 mysql-test__mysql_query 或其他数据库 MCP 工具；继续使用 web-research-firecrawl、用户指定信源和公开检索。',
+          '18. databaseSourceOptions.enabled 不是 true 时，不得调用 pg-sources__query、mysql-test__mysql_query 或其他数据库 MCP 工具；继续使用 web-research-firecrawl、用户指定信源和公开检索。',
         ];
     if (databaseSourceOptions.enabled) {
       databaseSourceRequirements.push(
-        `24. Database MCP recall must discover all news.data_YYYYMMDD tables through information_schema and check every table within lookbackDays=${databaseSourceOptions.lookbackDays}; do not cap the search to only the latest 10 or 11 tables.`,
-        `25. If strict phrase/entity matching returns fewer than maxMetadataRows=${databaseSourceOptions.maxMetadataRows}, broaden recall with entityTerms, actionTerms, domainTerms, and ngrams as OR conditions across titles, summaries, tags, and designated_tag until the candidate pool reaches maxMetadataRows or all in-window tables are exhausted.`,
-        '26. database_sources.json is a user-visible transparency artifact: keep up to maxMetadataRows URL-deduped metadata rows, including medium/low relevance rows with relevance_level and relevance_reason; do not discard rows solely because only summary matched.',
-        '27. database_query_plan.json must report tables_discovered, tables_checked, strict_hits, expanded_hits, total_hits, returned_sources, broadening_applied, content_rows_read, and database_source_fallback_reason. total_hits must mean candidate-pool size and returned_sources must equal database_sources.json row count.',
-        '28. Preserve title/url fallback fields when ch_title/data_source_url are empty. Never include content, raw_data, SQL, table names, or connection details in the final report or user-visible logs.',
-        '29. If context.json contains vectorDatabaseSources, treat them as PostgreSQL pgvector semantic database sources. Save sanitized fields to database/vector_sources.json, including title, url, summary, contentExcerpt, websiteName, publishTime, similarity, and relevanceScore. Use summary first; when summary is empty, use contentExcerpt as the internal evidence excerpt.',
-        '30. vectorDatabaseSources are additive evidence only: merge database/vector_sources.json with database_sources.json and public research evidence, cite only after cross-checking with Tavily/Exa/Firecrawl or other credible sources, and never let them replace mysql-test__mysql_query, harness_cli.py plan/run, Tavily, Exa, Firecrawl, research_*.json, consolidated.json, or synthesis steps.',
-        '31. embeddingText/embedding_text is recall-debug text only. Do not include embeddingText, embedding_text, SQL, table names, MCP implementation details, database connection details, full content, raw_data, or embedding vectors in user-visible logs or the final report.',
+        `24. If strict phrase/entity matching returns fewer than maxMetadataRows=${databaseSourceOptions.maxMetadataRows}, broaden recall with entityTerms, actionTerms, domainTerms, and ngrams as OR conditions across ch_title, entitle, summary, content, and embedding_text until the candidate pool reaches maxMetadataRows or PG returns no more relevant rows.`,
+        '25. database_sources.json is a user-visible transparency artifact: keep up to maxMetadataRows URL-deduped metadata rows, including medium/low relevance rows with relevance_level and relevance_reason; do not discard rows solely because only summary matched.',
+        '26. database_query_plan.json must report retrieval_mode, mcp_server, storageMode, sourceTable, query_terms, strict_hits, expanded_hits, vector_hits/total_hits, returned_sources, broadening_applied, content_rows_read, database_source_fallback_reason, and fallback_mcp when used. total_hits must mean candidate-pool size and returned_sources must equal database_sources.json row count.',
+        '27. Preserve title/url fallback fields when ch_title/data_source_url are empty. Never include content, raw_data, SQL, table names, MCP implementation details, database connection details, embedding_text, or embedding_vector in the final report or user-visible logs.',
+        '28. If context.json contains vectorDatabaseSources, treat them as already-prefetched PostgreSQL pgvector semantic database sources. Save sanitized fields to database/vector_sources.json, including title, url, summary, contentExcerpt, websiteName, publishTime, similarity, and relevanceScore. Merge them with database_sources.json; they may satisfy PG/vector pre-recall when queryPlan reports returnedSources > 0.',
+        '29. PG/vector sources cannot replace harness_cli.py plan/run, Tavily, Exa, Firecrawl, research_*.json, consolidated.json, or synthesis steps; they replace only the old MySQL-first database recall path.',
+        '30. embeddingText/embedding_text is recall-debug text only. Do not include embeddingText, embedding_text, SQL, table names, MCP implementation details, database connection details, full content, raw_data, or embedding vectors in user-visible logs or the final report.',
       );
     }
     return [
       `6. write-hb 的 report_type 为 ${reportType}，必须按该报种对应大纲撰写，不要混用 K报 与 HB报 结构。`,
       '7. known_context 如果是 JSON，必须先解析其 selectedSearchQueries、userProvidedSources、selectedModules、parameterValues、supplement；selectedModules 可能按章节提供 sectionKey、sectionTitle、selectedDirections；如果解析失败，再按普通文本上下文处理。',
-      `8. Research Phase 必须执行完整 K/HB 全量流水线：先写入 reports/${jobId}/context.json；如启用数据库信源，再完成 mysql-test__mysql_query 数据库预召回并保存 database/database_query_plan.json、database/database_sources.json；随后必须调用 /home/node/.openclaw/workspace/report-agent/skills/web-research-firecrawl/scripts/harness_cli.py plan 生成 plan.json 和 groups/group_A.json 等分组文件；再启动 research-${jobIdShort}-{X} 调研子任务，由子任务调用 harness_cli.py run 产出 research/research_{X}.json；最后合并为 research/consolidated.json 后才能进入撰稿。`,
-      '9. Research Phase 禁止把 research_cli.py brief 作为 K/HB 主调研路径；research_cli.py brief 只允许在 harness_cli.py plan/run 已失败且已记录 firecrawl_fallback_reason 时作为异常补充。数据库信源不能替代 Tavily、Exa、Firecrawl 三件套，不能减少 harness_cli.py run、research_*.json 或 consolidated.json 的生成要求。',
+      `8. Research Phase 必须执行完整 K/HB 全量流水线：先写入 reports/${jobId}/context.json；如启用数据库信源，再完成 pg-sources__query PG 向量库预召回并保存 database/database_query_plan.json、database/database_sources.json（仅在 PG 空结果/失败且已记录 fallback reason 后才可用 mysql-test__mysql_query 兜底）；随后必须调用 /home/node/.openclaw/workspace/report-agent/skills/web-research-firecrawl/scripts/harness_cli.py plan 生成 plan.json 和 groups/group_A.json 等分组文件；再启动 research-${jobIdShort}-{X} 调研子任务，由子任务调用 harness_cli.py run 产出 research/research_{X}.json；最后合并为 research/consolidated.json 后才能进入撰稿。`,
+      '9. Research Phase 禁止把 research_cli.py brief 作为 K/HB 主调研路径；research_cli.py brief 只允许在 harness_cli.py plan/run 已失败且已记录 firecrawl_fallback_reason 时作为异常补充。PG 向量信源不能替代 Tavily、Exa、Firecrawl 三件套，不能减少 harness_cli.py run、research_*.json 或 consolidated.json 的生成要求。',
       '10. Research Phase 输出必须形成完整内部素材包：context.json、plan.json、至少一个 groups/group_*.json、至少一个 research/research_*.json、research/consolidated.json、sources、evidence_cards、key_findings、verification_needed 和信息缺口；consolidated.json 或 research_*.json 中必须能看到 Tavily、Exa、Firecrawl 调研记录，除非三件套不可用且已记录明确 fallback reason。',
       '11. Write-HB Phase：只在 Research Phase 完成后，基于前置研究结果和用户 selectedModules，按 sectionTitle 对应的 K报/HB报一级章节逐章撰写；每章重点展开 selectedDirections，未选方向不得强行作为正文重点。',
       `12. 必须把完整成稿 Markdown 写入 ${OPENCLAW_CONTAINER_REPORT_DIR} 下的 .md 文件；不要只在对话中输出正文。`,
@@ -1736,7 +1739,7 @@ export class OpenClawService {
   private summarizeToolEvent(data: Record<string, unknown>) {
     const phase = typeof data.phase === 'string' ? data.phase : '';
     const name = this.extractToolName(data) || 'tool';
-    const detail = this.isDatabaseMcpTool(name) ? 'mysql-test__mysql_query read-only source lookup' : this.describeToolCall(name, data);
+    const detail = this.isDatabaseMcpTool(name) ? this.describeDatabaseMcpTool(name) : this.describeToolCall(name, data);
     const command = this.sanitizeText(detail || this.extractCommand(data), 220);
     const output = this.extractOutputText(data);
     const status = this.detectToolStatus(data, phase, output);
@@ -1776,13 +1779,14 @@ export class OpenClawService {
     const haystack = `${name} ${phase} ${command} ${output} ${sessionLabel}`.toLowerCase();
     const completed = status === 'completed' ? '已完成' : status === 'failed' ? '失败' : '进行中';
 
-    if (this.isDatabaseMcpTool(name) || /mysql-test__mysql_query|mysql_test__mysql_query|database_sources|database_query_plan|database_source_fallback_reason/.test(haystack)) {
+    if (this.isDatabaseMcpTool(name) || /pg-sources__query|pg_sources__query|mysql-test__mysql_query|mysql_test__mysql_query|database_sources|vector_sources|database_query_plan|database_source_fallback_reason/.test(haystack)) {
+      const pgSourceEvent = this.isPgSourceTool(name) || /pg-sources__query|pg_sources__query|vector_sources|pg_vector|pgvector/.test(haystack);
       return {
         phase: 'research_collecting',
         actor: 'main-agent',
-        label: '数据库信源检索',
-        summary: `数据库历史爬取信源检索${completed}。`,
-        detail: 'mysql-test__mysql_query read-only source lookup',
+        label: pgSourceEvent ? 'PG向量信源检索' : '数据库信源检索',
+        summary: `${pgSourceEvent ? 'PG向量信源召回' : '数据库信源检索'}${completed}。`,
+        detail: pgSourceEvent ? 'pg-sources__query PostgreSQL vector source lookup' : this.describeDatabaseMcpTool(name),
       };
     }
 
@@ -1940,10 +1944,11 @@ export class OpenClawService {
   }
 
   private buildToolSummary(name: string, phase: string, status: string, command: string, output: string, detail = ''): string {
-    if (this.isDatabaseMcpTool(name) || /mysql-test__mysql_query|mysql_test__mysql_query/i.test(command)) {
-      if (status === 'failed') return '数据库历史爬取信源检索失败，继续使用公开检索。';
-      if (status === 'started') return '正在检索数据库历史爬取信源。';
-      return '数据库历史爬取信源检索完成。';
+    if (this.isDatabaseMcpTool(name) || /pg-sources__query|pg_sources__query|mysql-test__mysql_query|mysql_test__mysql_query/i.test(command)) {
+      const pg = this.isPgSourceTool(name) || /pg-sources__query|pg_sources__query|pg_vector|pgvector/i.test(command);
+      if (status === 'failed') return pg ? 'PG向量信源召回失败，继续使用公开检索和必要兜底。' : '数据库信源检索失败，继续使用公开检索。';
+      if (status === 'started') return pg ? '正在召回PG向量信源库。' : '正在检索数据库信源。';
+      return pg ? 'PG向量信源召回完成。' : '数据库信源检索完成。';
     }
 
     if (status === 'started') {
@@ -1976,6 +1981,7 @@ export class OpenClawService {
   }
 
   private labelTool(name: string, command: string): string {
+    if (this.isPgSourceTool(name) || /pg-sources__query|pg_sources__query|pg_vector|pgvector/i.test(command)) return 'PG向量信源检索';
     if (this.isDatabaseMcpTool(name) || /mysql-test__mysql_query|mysql_test__mysql_query/i.test(command)) return '数据库信源检索';
     if (/search\.mjs/i.test(command) || /tavily-search/i.test(name)) return 'Tavily Search';
     if (/extract\.mjs/i.test(command) || /tavily-extract/i.test(name)) return 'Tavily Extract';
@@ -1986,7 +1992,16 @@ export class OpenClawService {
   }
 
   private isDatabaseMcpTool(name: string): boolean {
-    return /(?:^|[_-])mysql(?:[_-]|$)|mysql-test__mysql_query|mysql_query/i.test(name);
+    return this.isPgSourceTool(name) || /(?:^|[_-])mysql(?:[_-]|$)|mysql-test__mysql_query|mysql_query/i.test(name);
+  }
+
+  private isPgSourceTool(name: string): boolean {
+    return /pg-sources__query|pg_sources__query|(?:^|[_-])pg(?:[_-]|$)|pgvector|vector_materials/i.test(name);
+  }
+
+  private describeDatabaseMcpTool(name: string): string {
+    if (this.isPgSourceTool(name)) return 'pg-sources__query PostgreSQL vector source lookup';
+    return 'mysql-test__mysql_query fallback source lookup';
   }
 
   private describeToolCall(name: string, data: Record<string, unknown>): string {
