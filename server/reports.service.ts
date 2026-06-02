@@ -1719,7 +1719,31 @@ export class ReportsService {
   }
 
   private async renderMarkdownToHtml(markdown: string): Promise<string> {
-    const parsed = marked(markdown || '');
+    const parsed = marked(this.normalizeMarkdownStrongMarkers(markdown || ''));
     return typeof parsed === 'string' ? parsed : await parsed;
+  }
+
+  private normalizeMarkdownStrongMarkers(markdown: string): string {
+    const lines = markdown.split(/\r?\n/);
+    let inFence = false;
+
+    return lines
+      .map((line) => {
+        if (/^\s*```/.test(line)) {
+          inFence = !inFence;
+          return line;
+        }
+        if (inFence || !line.includes('**')) return line;
+
+        const inlineCode: string[] = [];
+        const masked = line.replace(/(`+)([^`]*?)\1/g, (match) => {
+          inlineCode.push(match);
+          return `\u0000CODE${inlineCode.length - 1}\u0000`;
+        });
+
+        const normalized = masked.replace(/\*\*([^*\n]+?)\*\*/g, '<strong>$1</strong>');
+        return normalized.replace(/\u0000CODE(\d+)\u0000/g, (_match, index) => inlineCode[Number(index)] || '');
+      })
+      .join('\n');
   }
 }
