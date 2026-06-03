@@ -338,8 +338,8 @@ export class ReportsService {
       });
     }
 
-    const artifactEvidence = await this.collectProgressArtifactEvidence(job);
-    for (const item of artifactEvidence) addEvidence(item.key, 'done', item.evidence);
+    const artifactEvidence = await this.collectTrustedProgressArtifactEvidence(job);
+    for (const item of artifactEvidence) addEvidence(item.key, item.status, item.evidence);
 
     if (job.status === 'succeeded') {
       for (const stage of PROGRESS_STAGE_DEFS) {
@@ -438,6 +438,63 @@ export class ReportsService {
     }
     await addIfExists('consolidate', this.remoteFs.joinPath(jobDir, 'research', 'consolidated.json'), '综合素材文件已生成。');
     await addIfExists('report', this.remoteFs.joinPath(jobDir, 'final', 'report.md'), '最终报告文件已生成。');
+    if (job.resultPath) await addIfExists('report', job.resultPath, '最终报告文件已登记。');
+    return result;
+  }
+
+  private async collectTrustedProgressArtifactEvidence(job: JobRecord): Promise<Array<{ key: ReportProgressStageKey; status: ReportProgressStageStatus; evidence: ReportProgressEvidence }>> {
+    const cachedJobDir = typeof job.artifacts?.openClawJobDir === 'string' ? job.artifacts.openClawJobDir : '';
+    if (cachedJobDir && !this.openClawJobDirMatchesJob(cachedJobDir, job.jobId)) {
+      const { openClawJobDir, ...restArtifacts } = job.artifacts || {};
+      job.artifacts = restArtifacts;
+    }
+
+    const jobDir = await this.resolveOpenClawJobDir(job) || this.remoteFs.joinPath(this.remoteFs.remoteDir, job.jobId);
+    const now = new Date().toISOString();
+    const result: Array<{ key: ReportProgressStageKey; status: ReportProgressStageStatus; evidence: ReportProgressEvidence }> = [];
+    const addIfExists = async (
+      key: ReportProgressStageKey,
+      filePath: string,
+      message: string,
+      status: ReportProgressStageStatus = 'done',
+    ) => {
+      try {
+        if (await this.remoteFs.exists(filePath)) {
+          result.push({ key, status, evidence: { source: key === 'report' ? 'report_file' : 'artifact', message, time: now } });
+        }
+      } catch {
+        // Missing artifacts are expected while a job is running.
+      }
+    };
+
+    await addIfExists('prepare', this.remoteFs.joinPath(jobDir, 'context.json'), '任务上下文文件已生成。');
+    await addIfExists('source', this.remoteFs.joinPath(jobDir, 'database', 'database_sources.json'), '数据库信源文件已生成。');
+    await addIfExists('source', this.remoteFs.joinPath(jobDir, 'database', 'vector_sources.json'), '向量信源文件已生成。');
+    await addIfExists('source', this.remoteFs.joinPath(jobDir, 'database', 'database_query_plan.json'), '信源查询计划已生成。');
+    await addIfExists('plan', this.remoteFs.joinPath(jobDir, 'plan.json'), '调研计划文件已生成。');
+    try {
+      const groupEntries = await this.remoteFs.readdir(this.remoteFs.joinPath(jobDir, 'groups'));
+      if (groupEntries.some((entry) => entry.isFile && /^group_[a-z0-9_-]+\.json$/i.test(entry.name))) {
+        result.push({ key: 'plan', status: 'done', evidence: { source: 'artifact', message: '调研分组文件已生成。', time: now } });
+      }
+    } catch {
+      // Group files are created later in the workflow.
+    }
+    try {
+      const researchEntries = await this.remoteFs.readdir(this.remoteFs.joinPath(jobDir, 'research'));
+      if (researchEntries.some((entry) => entry.isFile && /^research_[a-z0-9_-]+\.json$/i.test(entry.name))) {
+        result.push({ key: 'research', status: 'done', evidence: { source: 'artifact', message: '调研结果文件已生成。', time: now } });
+      }
+    } catch {
+      // Research files are created later in the workflow.
+    }
+    await addIfExists('consolidate', this.remoteFs.joinPath(jobDir, 'research', 'consolidated.json'), '综合素材文件已生成。');
+    await addIfExists(
+      'report',
+      this.remoteFs.joinPath(jobDir, 'final', 'report.md'),
+      '最终报告文件已生成。',
+      job.status === 'succeeded' || job.resultPath ? 'done' : 'running',
+    );
     if (job.resultPath) await addIfExists('report', job.resultPath, '最终报告文件已登记。');
     return result;
   }
@@ -1812,6 +1869,9 @@ export class ReportsService {
   }
 
   private async resolveOpenClawJobDir(job: JobRecord): Promise<string | null> {
+    const exactDir = this.remoteFs.joinPath(this.remoteFs.remoteDir, job.jobId);
+    if (job.status === 'queued' || job.status === 'running') return exactDir;
+
     const fromKnownPath = await this.resolveOpenClawJobDirFromKnownPaths(job);
     if (fromKnownPath) return fromKnownPath;
 
@@ -1844,8 +1904,9 @@ export class ReportsService {
       if (!mtimeMs) continue;
 
       const inWindow = mtimeMs >= createdAtMs - 15 * 60_000 && mtimeMs <= updatedAtMs + 15 * 60_000;
+      if (!inWindow || !(await this.openClawJobDirHasJobEvidence(dir, job))) continue;
       const proximity = Math.abs(mtimeMs - updatedAtMs);
-      const score = (inWindow ? 0 : 10_000_000_000) + proximity;
+      const score = proximity;
       candidates.push({ dir, score });
     }
 
@@ -1874,6 +1935,20 @@ export class ReportsService {
       if (await this.hasDatabaseSourceFiles(dir)) return dir;
     }
     return null;
+  }
+
+  private openClawJobDirMatchesJob(dir: string, jobId: string): boolean {
+    return dir.replace(/\\/g, '/').split('/').filter(Boolean).pop() === jobId;
+  }
+
+  private async openClawJobDirHasJobEvidence(dir: string, job: JobRecord): Promise<boolean> {
+    if (this.openClawJobDirMatchesJob(dir, job.jobId)) return true;
+    try {
+      const contextText = await this.remoteFs.readFile(this.remoteFs.joinPath(dir, 'context.json'));
+      return contextText.includes(job.jobId);
+    } catch {
+      return false;
+    }
   }
 
   private extractOpenClawJobDirs(text: string): string[] {
