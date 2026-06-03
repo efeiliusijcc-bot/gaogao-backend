@@ -27,8 +27,8 @@ export class ReportsController {
   }
 
   @Get(':jobId')
-  get(@Param('jobId') jobId: string) {
-    const job = this.reports.getJob(jobId);
+  async get(@Param('jobId') jobId: string) {
+    const job = await this.reports.getJobWithRecoveredReport(jobId);
     if (!job) {
       throw new HttpException({ error: 'Job not found' }, HttpStatus.NOT_FOUND);
     }
@@ -40,9 +40,19 @@ export class ReportsController {
       stage: job.stage,
       errorMessage: job.errorMessage,
       resultPath: job.resultPath,
+      progressState: job.progressState,
       createdAt: job.createdAt,
       updatedAt: job.updatedAt,
     };
+  }
+
+  @Get(':jobId/progress')
+  async progress(@Param('jobId') jobId: string) {
+    const result = await this.reports.getProgressState(jobId);
+    if (!result) {
+      throw new HttpException({ error: 'Job not found' }, HttpStatus.NOT_FOUND);
+    }
+    return result;
   }
 
   @Get(':jobId/event-log')
@@ -108,6 +118,20 @@ export class ReportsController {
   @Get(':jobId/database-sources')
   async databaseSources(@Param('jobId') jobId: string) {
     const result = await this.reports.getDatabaseSources(jobId);
+    if (result === undefined) {
+      throw new HttpException({ error: 'Job not found' }, HttpStatus.NOT_FOUND);
+    }
+    return result;
+  }
+
+  @Get(':jobId/sources')
+  async sources(
+    @Param('jobId') jobId: string,
+    @Query('type') type?: string,
+    @Query('page') page?: string,
+    @Query('pageSize') pageSize?: string,
+  ) {
+    const result = await this.reports.getSources(jobId, { type, page, pageSize });
     if (result === undefined) {
       throw new HttpException({ error: 'Job not found' }, HttpStatus.NOT_FOUND);
     }

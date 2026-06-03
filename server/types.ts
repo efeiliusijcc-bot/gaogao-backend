@@ -1,6 +1,29 @@
 import type { ReportPayload, SkillName } from '../src/types/report.js';
 
 export type ReportJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'waiting_approval';
+export type ReportProgressStageKey = 'prepare' | 'source' | 'plan' | 'research' | 'consolidate' | 'report';
+export type ReportProgressStageStatus = 'not_started' | 'running' | 'done' | 'failed';
+
+export interface ReportProgressEvidence {
+  source: 'event' | 'tool_event' | 'artifact' | 'report_file' | 'job_status';
+  message: string;
+  time: string;
+}
+
+export interface ReportProgressStage {
+  key: ReportProgressStageKey;
+  title: string;
+  desc: string;
+  status: ReportProgressStageStatus;
+  evidence: ReportProgressEvidence[];
+}
+
+export interface ReportProgressState {
+  jobId: string;
+  currentStage: ReportProgressStageKey | null;
+  updatedAt: string;
+  stages: ReportProgressStage[];
+}
 
 export interface JobRecord {
   jobId: string;
@@ -16,6 +39,7 @@ export interface JobRecord {
   updatedAt: string;
   events: ServerEvent[];
   eventLog: EventLogEntry[];
+  progressState?: ReportProgressState;
 }
 
 export interface EventLogEntry {
@@ -33,6 +57,7 @@ export interface EventLogEntry {
 
 export type ServerEvent =
   | { type: 'stage'; stage: string; message: string }
+  | { type: 'progress_state'; progressState: ReportProgressState }
   | { type: 'status'; status: string; message?: string }
   | { type: 'token'; content: string }
   | { type: 'text_delta'; content: string }
@@ -40,6 +65,7 @@ export type ServerEvent =
   | { type: 'tool_delta'; id?: string; name?: string; raw: unknown }
   | { type: 'tool_end'; id?: string; name?: string; raw: unknown }
   | { type: 'tool_error'; id?: string; name?: string; message: string; raw?: unknown }
+  | { type: 'sources'; sources: Record<string, unknown>[] }
   | { type: 'approval_required'; commands: string[]; message: string; partialOutput?: string }
   | { type: 'artifact'; name: string; available: boolean }
   | { type: 'done'; jobId: string }

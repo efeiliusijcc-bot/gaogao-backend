@@ -6,7 +6,17 @@ import { OpenClawApprovalRequiredError, OpenClawService } from './openclaw.servi
 import { RemoteFileService } from './remote-file.service.js';
 import { VectorSourceService, type VectorSearchResult, type VectorSourceItem } from './vector-source.service.js';
 import type { CreateJobRequest } from '../src/types/report.js';
-import type { EventLogEntry, JobRecord, RunInput, ServerEvent } from './types.js';
+import type {
+  EventLogEntry,
+  JobRecord,
+  ReportProgressEvidence,
+  ReportProgressStage,
+  ReportProgressStageKey,
+  ReportProgressStageStatus,
+  ReportProgressState,
+  RunInput,
+  ServerEvent,
+} from './types.js';
 
 type JobListTypeFilter = 'all' | 'write-hb-k' | 'write-hb-hb' | 'person-intelligence-report' | 'risk-assessment-reports';
 
@@ -62,6 +72,15 @@ interface DatabaseSourcesResponse {
 }
 
 type ReportSourceListType = 'all' | 'report_refs' | 'structured_sources' | 'candidate_hits' | 'extract_failed';
+
+const PROGRESS_STAGE_DEFS: Array<Omit<ReportProgressStage, 'status' | 'evidence'>> = [
+  { key: 'prepare', title: '任务准备', desc: '整理编报要求并建立任务空间' },
+  { key: 'source', title: '信源筛选', desc: '检索并筛选与主题相关的可信信源' },
+  { key: 'plan', title: '调研规划', desc: '拆解调研方向并安排采集任务' },
+  { key: 'research', title: '资料采集', desc: '采集公开资料并提取关键事实' },
+  { key: 'consolidate', title: '素材整合', desc: '汇总信源、证据和分析要点' },
+  { key: 'report', title: '报告生成', desc: '生成报告正文并完成校验' },
+];
 
 interface ReportSourcesOptions {
   type?: string;
@@ -128,6 +147,7 @@ export class ReportsService {
       events: [],
       eventLog: [],
     };
+    job.progressState = this.buildInitialProgressState(job);
 
     this.jobs.set(jobId, job);
     this.streams.set(jobId, new Subject<ServerEvent>());
@@ -188,6 +208,13 @@ export class ReportsService {
     return { jobId, items: job.eventLog ?? [] };
   }
 
+  async getProgressState(jobId: string): Promise<ReportProgressState | undefined> {
+    const job = this.jobs.get(jobId);
+    if (!job) return undefined;
+    await this.refreshProgressState(job);
+    return job.progressState;
+  }
+
   private serializeJob(job: JobRecord) {
     return {
       jobId: job.jobId,
@@ -197,6 +224,7 @@ export class ReportsService {
       stage: job.stage,
       errorMessage: job.errorMessage,
       resultPath: job.resultPath,
+      progressState: job.progressState,
       createdAt: job.createdAt,
       updatedAt: job.updatedAt,
     };
@@ -247,6 +275,215 @@ export class ReportsService {
     if (Array.isArray(value)) return value.map((item) => this.payloadSearchText(item)).join(' ');
     if (typeof value === 'object') return Object.values(value).map((item) => this.payloadSearchText(item)).join(' ');
     return '';
+  }
+
+  private buildInitialProgressState(job: JobRecord): ReportProgressState {
+    const now = new Date().toISOString();
+    return {
+      jobId: job.jobId,
+      currentStage: job.status === 'queued' || job.status === 'running' ? 'prepare' : null,
+      updatedAt: now,
+      stages: PROGRESS_STAGE_DEFS.map((stage, index) => ({
+        ...stage,
+        status: index === 0 && (job.status === 'queued' || job.status === 'running') ? 'running' : 'not_started',
+        evidence: index === 0
+          ? [{ source: 'job_status', message: `任务状态：${job.status}`, time: now }]
+          : [],
+      })),
+    };
+  }
+
+  private async refreshProgressState(job: JobRecord, emit = false): Promise<ReportProgressState> {
+    const state = await this.computeProgressState(job);
+    job.progressState = state;
+    if (emit) this.emitProgressState(job, state);
+    else void this.writeJobState(job);
+    return state;
+  }
+
+  private emitProgressState(job: JobRecord, progressState: ReportProgressState): void {
+    job.events = job.events.filter((event) => event.type !== 'progress_state');
+    const event: ServerEvent = { type: 'progress_state', progressState };
+    job.events.push(event);
+    this.streams.get(job.jobId)?.next(event);
+    void this.writeJobState(job);
+  }
+
+  private async computeProgressState(job: JobRecord): Promise<ReportProgressState> {
+    const evidenceByStage = new Map<ReportProgressStageKey, ReportProgressEvidence[]>();
+    const statusByStage = new Map<ReportProgressStageKey, ReportProgressStageStatus>();
+    const addEvidence = (
+      key: ReportProgressStageKey,
+      status: ReportProgressStageStatus,
+      evidence: ReportProgressEvidence,
+    ) => {
+      evidenceByStage.set(key, [...(evidenceByStage.get(key) || []), evidence]);
+      const current = statusByStage.get(key);
+      if (current === 'failed') return;
+      if (status === 'failed' || current !== 'done') statusByStage.set(key, status);
+    };
+
+    const now = new Date().toISOString();
+    if (job.status === 'queued' || job.status === 'running') {
+      addEvidence('prepare', 'running', { source: 'job_status', message: `任务状态：${job.status}`, time: job.updatedAt || now });
+    }
+
+    for (const entry of job.eventLog || []) {
+      const mapped = this.progressStageFromEventLog(entry);
+      if (!mapped) continue;
+      addEvidence(mapped.key, mapped.status, {
+        source: entry.type === 'tool_start' || entry.type === 'tool_end' || entry.type === 'tool_error' ? 'tool_event' : 'event',
+        message: entry.summary || entry.label || entry.phase || mapped.key,
+        time: entry.time || now,
+      });
+    }
+
+    const artifactEvidence = await this.collectProgressArtifactEvidence(job);
+    for (const item of artifactEvidence) addEvidence(item.key, 'done', item.evidence);
+
+    if (job.status === 'succeeded') {
+      for (const stage of PROGRESS_STAGE_DEFS) {
+        addEvidence(stage.key, 'done', {
+          source: stage.key === 'report' ? 'report_file' : 'job_status',
+          message: stage.key === 'report' ? '最终报告已确认生成。' : '任务已成功完成。',
+          time: job.updatedAt || now,
+        });
+      }
+    }
+
+    if (job.status === 'failed' || job.status === 'cancelled' || job.status === 'waiting_approval') {
+      const failedKey = this.lastStartedProgressStage(statusByStage) || 'prepare';
+      addEvidence(failedKey, 'failed', {
+        source: 'job_status',
+        message: job.errorMessage || `任务状态：${job.status}`,
+        time: job.updatedAt || now,
+      });
+    }
+
+    const stages = this.normalizeProgressStageOrder(PROGRESS_STAGE_DEFS.map((stage) => ({
+      ...stage,
+      status: statusByStage.get(stage.key) || 'not_started',
+      evidence: evidenceByStage.get(stage.key) || [],
+    })));
+    const currentStage = this.currentProgressStage(stages);
+    return {
+      jobId: job.jobId,
+      currentStage,
+      updatedAt: now,
+      stages,
+    };
+  }
+
+  private progressStageFromEventLog(entry: EventLogEntry): { key: ReportProgressStageKey; status: ReportProgressStageStatus } | null {
+    const haystack = `${entry.phase || ''} ${entry.label || ''} ${entry.summary || ''} ${entry.command || ''} ${entry.detail || ''}`.toLowerCase();
+    const status: ReportProgressStageStatus =
+      entry.type === 'tool_error' || entry.status === 'failed'
+        ? 'failed'
+        : entry.type === 'tool_end' || entry.status === 'completed' || /已完成|完成/.test(entry.summary || '')
+          ? 'done'
+          : 'running';
+
+    if (/waiting_final_report|gateway_fallback|openclaw:|^start$|^running$|received/.test(entry.phase || '')) return null;
+    if (/context_preparing|context\.json|preparing openclaw/.test(haystack)) return { key: 'prepare', status };
+    if (/pg向量|pg-sources|pg_sources|vector_sources|database_sources|database_query_plan|数据库信源|信源检索/.test(haystack)) return { key: 'source', status };
+    if (/research_planning|harness_cli\.py\s+plan|plan\.json|调研计划/.test(haystack)) return { key: 'plan', status };
+    if (/research_dispatch|research_waiting|research_collecting|harness_cli\.py\s+run|research_|sessions_spawn|sessions_yield|资料|调研子任务/.test(haystack)) return { key: 'research', status };
+    if (/research_consolidating|consolidated\.json|素材整合|证据包/.test(haystack)) return { key: 'consolidate', status };
+    if (/synthesis|report_saving|report_verifying|final\/report\.md|报告文件|撰写|校验报告/.test(haystack)) {
+      return { key: 'report', status: status === 'failed' ? 'failed' : 'running' };
+    }
+    return null;
+  }
+
+  private async collectProgressArtifactEvidence(job: JobRecord): Promise<Array<{ key: ReportProgressStageKey; evidence: ReportProgressEvidence }>> {
+    const reportDir = this.remoteFs.remoteDir;
+    const cachedJobDir = typeof job.artifacts?.openClawJobDir === 'string' ? job.artifacts.openClawJobDir : '';
+    const resolvedJobDir = cachedJobDir || await this.resolveOpenClawJobDir(job);
+    if (resolvedJobDir && resolvedJobDir !== cachedJobDir) {
+      job.artifacts = { ...job.artifacts, openClawJobDir: resolvedJobDir };
+    }
+    const jobDir = resolvedJobDir || this.remoteFs.joinPath(reportDir, job.jobId);
+    const now = new Date().toISOString();
+    const result: Array<{ key: ReportProgressStageKey; evidence: ReportProgressEvidence }> = [];
+    const addIfExists = async (key: ReportProgressStageKey, filePath: string, message: string) => {
+      try {
+        if (await this.remoteFs.exists(filePath)) {
+          result.push({ key, evidence: { source: key === 'report' ? 'report_file' : 'artifact', message, time: now } });
+        }
+      } catch {
+        // Missing artifacts are expected while a job is running.
+      }
+    };
+
+    await addIfExists('prepare', this.remoteFs.joinPath(jobDir, 'context.json'), '任务上下文文件已生成。');
+    await addIfExists('source', this.remoteFs.joinPath(jobDir, 'database', 'database_sources.json'), '数据库信源文件已生成。');
+    await addIfExists('source', this.remoteFs.joinPath(jobDir, 'database', 'vector_sources.json'), '向量信源文件已生成。');
+    await addIfExists('source', this.remoteFs.joinPath(jobDir, 'database', 'database_query_plan.json'), '信源查询计划已生成。');
+    await addIfExists('plan', this.remoteFs.joinPath(jobDir, 'plan.json'), '调研计划文件已生成。');
+    try {
+      const groupEntries = await this.remoteFs.readdir(this.remoteFs.joinPath(jobDir, 'groups'));
+      if (groupEntries.some((entry) => entry.isFile && /^group_[a-z0-9_-]+\.json$/i.test(entry.name))) {
+        result.push({ key: 'plan', evidence: { source: 'artifact', message: '调研分组文件已生成。', time: now } });
+      }
+    } catch {
+      // Group files are created later in the workflow.
+    }
+    try {
+      const researchEntries = await this.remoteFs.readdir(this.remoteFs.joinPath(jobDir, 'research'));
+      if (researchEntries.some((entry) => entry.isFile && /^research_[a-z0-9_-]+\.json$/i.test(entry.name))) {
+        result.push({ key: 'research', evidence: { source: 'artifact', message: '调研结果文件已生成。', time: now } });
+      }
+    } catch {
+      // Research files are created later in the workflow.
+    }
+    await addIfExists('consolidate', this.remoteFs.joinPath(jobDir, 'research', 'consolidated.json'), '综合素材文件已生成。');
+    await addIfExists('report', this.remoteFs.joinPath(jobDir, 'final', 'report.md'), '最终报告文件已生成。');
+    if (job.resultPath) await addIfExists('report', job.resultPath, '最终报告文件已登记。');
+    return result;
+  }
+
+  private lastStartedProgressStage(statusByStage: Map<ReportProgressStageKey, ReportProgressStageStatus>): ReportProgressStageKey | null {
+    let result: ReportProgressStageKey | null = null;
+    for (const stage of PROGRESS_STAGE_DEFS) {
+      if (statusByStage.has(stage.key)) result = stage.key;
+    }
+    return result;
+  }
+
+  private normalizeProgressStageOrder(stages: ReportProgressStage[]): ReportProgressStage[] {
+    const failedIndex = stages.findIndex((stage) => stage.status === 'failed');
+    const observableLimit = failedIndex >= 0
+      ? failedIndex
+      : stages.reduce((last, stage, index) => stage.status !== 'not_started' ? index : last, -1);
+    if (observableLimit <= 0) return stages;
+
+    const now = new Date().toISOString();
+    return stages.map((stage, index) => {
+      if (index >= observableLimit || stage.status === 'failed' || stage.status === 'done') return stage;
+      return {
+        ...stage,
+        status: 'done',
+        evidence: [
+          ...stage.evidence,
+          {
+            source: 'artifact',
+            message: `已观察到后续阶段“${stages[observableLimit].title}”的真实执行证据。`,
+            time: now,
+          },
+        ],
+      };
+    });
+  }
+
+  private currentProgressStage(stages: ReportProgressStage[]): ReportProgressStageKey | null {
+    const failed = stages.find((stage) => stage.status === 'failed');
+    if (failed) return failed.key;
+    const running = stages.find((stage) => stage.status === 'running');
+    if (running) return running.key;
+    for (let index = stages.length - 1; index >= 0; index -= 1) {
+      if (stages[index].status === 'done') return stages[index].key;
+    }
+    return null;
   }
 
   async getResult(jobId: string) {
@@ -615,6 +852,10 @@ export class ReportsService {
   }
 
   private pushEvent(job: JobRecord, event: ServerEvent) {
+    if (event.type === 'progress_state') {
+      this.emitProgressState(job, event.progressState);
+      return;
+    }
     job.events.push(event);
     const logEntry = this.toEventLogEntry(job, event);
     if (logEntry) {
@@ -626,6 +867,7 @@ export class ReportsService {
     }
     this.streams.get(job.jobId)?.next(event);
     void this.writeJobState(job);
+    void this.refreshProgressState(job, true);
   }
 
   private toEventLogEntry(job: JobRecord, event: ServerEvent): EventLogEntry | null {
@@ -955,6 +1197,7 @@ export class ReportsService {
                 errorMessage: parsed.errorMessage,
                 events: [],
                 eventLog: Array.isArray(parsed.eventLog) ? parsed.eventLog.filter((item) => item && typeof item === 'object') as EventLogEntry[] : [],
+                progressState: parsed.progressState,
               } as JobRecord);
             } catch {
               // Ignore corrupted persisted job files.
@@ -1690,6 +1933,9 @@ export class ReportsService {
     if (text.length < 1000 && !/REPORT_FILE:\s*\/.+\.md/i.test(text)) {
       throw new Error('OpenClaw report-agent returned too little report content.');
     }
+    if (this.hasForbiddenWriteHbPrefaceHeadings(text)) {
+      throw new Error('OpenClaw report-agent returned invalid K/HB format: standalone 导语/摘要 headings are not allowed.');
+    }
   }
 
   private isValidReportMarkdown(markdown: string, size: number): boolean {
@@ -1704,7 +1950,23 @@ export class ReportsService {
     if (/please try again/i.test(text) && text.length < 1000) return false;
     if (/quota exhausted|429\s+quota|500\s+internal|internal error/i.test(text) && text.length < 2000) return false;
     if (/报告已生成并保存/.test(text) && size < 5000) return false;
+    if (this.hasForbiddenWriteHbPrefaceHeadings(text)) return false;
     return true;
+  }
+
+  private hasForbiddenWriteHbPrefaceHeadings(markdown: string): boolean {
+    const text = String(markdown || '');
+    const looksLikeWriteHb =
+      /\*\*编号：\*\*\s*[KH]-\d{8}-\d{3}/.test(text) ||
+      /##\s*\*\*一、基本情况\*\*/.test(text) ||
+      /##\s*\*\*二、涉我风险/.test(text) ||
+      /##\s*\*\*三、对策建议/.test(text) ||
+      /##\s*\*\*一、事件概述\*\*/.test(text);
+    if (!looksLikeWriteHb) return false;
+
+    const beforeFirstSection = text.split(/##\s*\*\*一、(?:基本情况|事件概述)\*\*/)[0] || text;
+    return /(?:^|\n)\s{0,3}#{1,6}\s*(?:导语|摘要|导语\s*[/／、-]\s*摘要|摘要\s*导语)\s*(?:\n|$)/.test(beforeFirstSection) ||
+      /(?:^|\n)\s*(?:导语|摘要|导语\s*[/／、-]\s*摘要|摘要\s*导语)\s*(?:\n|$)/.test(beforeFirstSection);
   }
 
   private buildRequestUser(job: JobRecord): string {
