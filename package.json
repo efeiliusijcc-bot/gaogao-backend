@@ -4,14 +4,12 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "tsx server/index.ts",
     "server": "tsc -p tsconfig.server.json && node dist-server/server/index.js",
-    "dev:all": "concurrently \"pnpm dev\" \"pnpm server\"",
     "backfill:vector-materials": "tsx scripts/backfill-vector-materials.ts",
     "backfill:vector-materials:qwen3": "tsx scripts/backfill-vector-materials.ts --pg-table=vector_materials_qwen3 --embedding-model=Qwen3-Embedding-0.6B-Q8 --embedding-dimensions=1024 --max-text-chars=600 --batch-size=1",
-    "build": "tsc -b && vite build",
-    "lint": "eslint .",
-    "preview": "vite preview"
+    "build": "tsc -p tsconfig.server.json",
+    "lint": "eslint ."
   },
   "dependencies": {
     "@nestjs/common": "^11.1.19",
@@ -25,9 +23,6 @@
     "marked": "^18.0.2",
     "openai": "^6.34.0",
     "pg": "^8.21.0",
-    "react": "^19.2.5",
-    "react-dom": "^19.2.5",
-    "react-router-dom": "^7.14.1",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2",
     "uuid": "^14.0.0",
@@ -40,19 +35,12 @@
     "@types/dotenv": "^8.2.3",
     "@types/express": "^5.0.6",
     "@types/node": "^24.12.2",
-    "@types/react": "^19.2.14",
-    "@types/react-dom": "^19.2.3",
     "@types/uuid": "^11.0.0",
     "@types/ws": "^8.18.1",
-    "@vitejs/plugin-react": "^6.0.1",
-    "concurrently": "^9.2.1",
     "eslint": "^9.39.4",
-    "eslint-plugin-react-hooks": "^7.1.1",
-    "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17.5.0",
     "tsx": "^4.21.0",
     "typescript": "~6.0.2",
-    "typescript-eslint": "^8.58.2",
-    "vite": "^8.0.9"
+    "typescript-eslint": "^8.58.2"
   }
 }

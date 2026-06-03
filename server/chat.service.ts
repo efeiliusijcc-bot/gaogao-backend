@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { Subject } from 'rxjs';
 import { v4 as uuid } from 'uuid';
 import { OpenClawService } from './openclaw.service.js';
+import { QaSessionSourcesService } from './qa-session-sources.service.js';
 import type { ServerEvent } from './types.js';
 
 interface ChatRequest {
@@ -15,7 +16,10 @@ export class ChatService {
   private readonly streams = new Map<string, Subject<ServerEvent>>();
   private readonly history = new Map<string, ServerEvent[]>();
 
-  constructor(private readonly openClaw: OpenClawService) {}
+  constructor(
+    private readonly openClaw: OpenClawService,
+    private readonly qaSources: QaSessionSourcesService,
+  ) {}
 
   async complete(body: ChatRequest) {
     if (body.stream) {
@@ -28,6 +32,8 @@ export class ChatService {
 
     const events: ServerEvent[] = [];
     const text = await this.openClaw.streamQa(body.messages, (event) => events.push(event), body.sessionId);
+    const sourceEvent = await this.buildQaSourcesEvent(body.sessionId);
+    if (sourceEvent) events.push(sourceEvent);
     return {
       choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
       events,
@@ -44,6 +50,8 @@ export class ChatService {
   private async runStream(streamId: string, messages: ChatRequest['messages'], sessionId?: string) {
     try {
       await this.openClaw.streamQa(messages, (event) => this.push(streamId, event), sessionId);
+      const sourceEvent = await this.buildQaSourcesEvent(sessionId);
+      if (sourceEvent) this.push(streamId, sourceEvent);
       this.push(streamId, { type: 'done', jobId: streamId });
       this.streams.get(streamId)?.complete();
     } catch (error) {
@@ -55,5 +63,13 @@ export class ChatService {
   private push(streamId: string, event: ServerEvent) {
     this.history.get(streamId)?.push(event);
     this.streams.get(streamId)?.next(event);
+  }
+
+  private async buildQaSourcesEvent(sessionId?: string): Promise<ServerEvent | null> {
+    if (!sessionId) return null;
+    const sources = this.openClaw.extractQaSessionSources(sessionId);
+    if (!sources.length) return null;
+    await this.qaSources.upsertSources(sessionId, { sources, merge: true });
+    return { type: 'sources', sources };
   }
 }

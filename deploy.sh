@@ -60,9 +60,19 @@ docker run -d \
   -e OPENCLAW_BASE_URL=http://openclaw:18789/v1 \
   -e OPENCLAW_API_KEY=${OPENCLAW_API_KEY} \
   -e OPENCLAW_MODEL=openclaw/report-agent \
+  -e OPENCLAW_QA_AGENT_ID=${OPENCLAW_QA_AGENT_ID:-qa-agent} \
+  -e OPENCLAW_QA_MODEL=${OPENCLAW_QA_MODEL:-openclaw/qa-agent} \
+  -e OPENCLAW_QA_TIMEOUT_MS=${OPENCLAW_QA_TIMEOUT_MS:-900000} \
   -e OPENCLAW_REMOTE_HOST= \
   -e REPORT_OUTPUT_DIR=/home/node/.openclaw/workspace/report-agent/reports \
   -e OPENCLAW_REMOTE_REPORT_DIR=/home/node/.openclaw/workspace/report-agent/reports \
+  -e PGVECTOR_DATABASE_URL=${PGVECTOR_DATABASE_URL:-postgres://postgres:passok@todo_postgres:5432/news} \
+  -e PGVECTOR_NEWS_TABLE=${PGVECTOR_NEWS_TABLE:-vector_materials_qwen3} \
+  -e PGVECTOR_EMBEDDING_MODEL=${PGVECTOR_EMBEDDING_MODEL:-Qwen3-Embedding-0.6B-Q8} \
+  -e PGVECTOR_EMBEDDING_DIMENSIONS=${PGVECTOR_EMBEDDING_DIMENSIONS:-1024} \
+  -e PGVECTOR_EMBEDDING_INPUT_CHARS=${PGVECTOR_EMBEDDING_INPUT_CHARS:-600} \
+  -e PGVECTOR_EMBEDDING_BASE_URL=${PGVECTOR_EMBEDDING_BASE_URL:-http://69.165.75.20:8080/v1} \
+  -e OPENAI_API_KEY=${OPENAI_API_KEY:-local-qwen3-embedding} \
   -v /usr/docker/openclaw:/home/node/.openclaw \
   gaogao-api:latest
 

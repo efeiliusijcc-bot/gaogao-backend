@@ -81,12 +81,13 @@ export class OpenClawGatewayDeviceService {
     sessionKey?: string;
     label?: string;
     onEvent?: (event: { type: string; payload: unknown }) => void;
+    earlyResolve?: (sessionKey: string) => Promise<unknown>;
   }) {
     const idempotencyKey = crypto.randomUUID();
     const sessionKey = params.sessionKey || `agent:${params.agentId}:openai:${idempotencyKey}`;
     return this.withClient((client) => {
       if (params.onEvent) client.onGatewayEvent = params.onEvent;
-      return client.request(
+      const request = client.request(
         'agent',
         {
           agentId: params.agentId,
@@ -100,6 +101,9 @@ export class OpenClawGatewayDeviceService {
         },
         { timeoutMs: params.timeoutMs + 30000 },
       );
+      if (!params.earlyResolve) return request;
+      request.catch(() => undefined);
+      return Promise.race([request, params.earlyResolve(sessionKey)]);
     });
   }
 

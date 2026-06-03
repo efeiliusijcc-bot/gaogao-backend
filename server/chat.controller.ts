@@ -1,11 +1,15 @@
-import { Body, Controller, Get, HttpException, HttpStatus, Param, Post, Sse } from '@nestjs/common';
+import { Body, Controller, Get, HttpException, HttpStatus, Param, Post, Put, Sse } from '@nestjs/common';
 import { Observable } from 'rxjs';
 import { ChatService } from './chat.service.js';
+import { QaSessionSourcesService } from './qa-session-sources.service.js';
 import type { ServerEvent } from './types.js';
 
 @Controller('/api/chat')
 export class ChatController {
-  constructor(private readonly chat: ChatService) {}
+  constructor(
+    private readonly chat: ChatService,
+    private readonly qaSources: QaSessionSourcesService,
+  ) {}
 
   @Post('completions')
   completions(@Body() body: { messages?: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>; stream?: boolean; sessionId?: string }) {
@@ -36,5 +40,15 @@ export class ChatController {
       });
       return () => subscription.unsubscribe();
     });
+  }
+
+  @Get('sessions/:sessionId/sources')
+  sources(@Param('sessionId') sessionId: string) {
+    return this.qaSources.getSources(sessionId);
+  }
+
+  @Put('sessions/:sessionId/sources')
+  upsertSources(@Param('sessionId') sessionId: string, @Body() body: { sources?: unknown; merge?: boolean }) {
+    return this.qaSources.upsertSources(sessionId, body || {});
   }
 }

@@ -42,6 +42,8 @@ export const OPENCLAW_WS_URL =
 export const OPENCLAW_STATE_DIR = process.env.OPENCLAW_STATE_DIR || path.join(os.homedir(), '.openclaw');
 export const REPORT_OUTPUT_DIR =
   process.env.REPORT_OUTPUT_DIR || path.join(OPENCLAW_STATE_DIR, 'workspace', 'report-agent', 'reports');
+export const OPENCLAW_QA_ARTIFACT_DIR =
+  process.env.OPENCLAW_QA_ARTIFACT_DIR || path.join(OPENCLAW_STATE_DIR, 'workspace', OPENCLAW_QA_AGENT_ID, 'sessions');
 export const OPENCLAW_REMOTE_HOST = process.env.OPENCLAW_REMOTE_HOST || '';
 export const OPENCLAW_REMOTE_USER = process.env.OPENCLAW_REMOTE_USER || 'root';
 export const OPENCLAW_REMOTE_SSH_KEY =
