@@ -71,7 +71,10 @@ interface DatabaseSourcesResponse {
   vectorPlan?: VectorQueryPlanSummary;
 }
 
-type ReportSourceListType = 'all' | 'report_refs' | 'structured_sources' | 'candidate_hits' | 'extract_failed';
+type ReportSourceListType = 'all' | 'database_recall' | 'tool_search' | 'report_refs' | 'structured_sources' | 'candidate_hits' | 'extract_failed';
+type ReportSourceOrigin = 'database_recall' | 'tool_search';
+type ReportEvidenceKind = 'report_reference' | 'structured_source' | 'research_source' | 'evidence_card';
+type ReportSourceEngine = 'exa' | 'firecrawl' | 'tavily' | 'tavily_extract' | 'pg_vector' | 'database';
 
 const PROGRESS_STAGE_DEFS: Array<Omit<ReportProgressStage, 'status' | 'evidence'>> = [
   { key: 'prepare', title: '任务准备', desc: '整理编报要求并建立任务空间' },
@@ -91,6 +94,9 @@ interface ReportSourcesOptions {
 interface ReportSourceListItem {
   id: string;
   sourceGroup: Exclude<ReportSourceListType, 'all'>;
+  sourceOrigin?: ReportSourceOrigin;
+  evidenceKind?: ReportEvidenceKind;
+  engine?: ReportSourceEngine;
   citationNo?: number;
   title: string;
   url?: string;
@@ -117,6 +123,13 @@ interface ReportSourcesResponse {
   totalPages: number;
   hasMore: boolean;
   meta?: Record<string, unknown>;
+}
+
+interface ReportSourceSummary {
+  databaseRecallCount: number;
+  toolSearchCount: number;
+  reportReferenceCount: number;
+  structuredSourceCount: number;
 }
 
 @Injectable()
@@ -689,20 +702,32 @@ export class ReportsService {
     const page = this.parsePositiveInt(options.page, 1);
     const pageSize = Math.min(this.parsePositiveInt(options.pageSize, 10), 100);
 
-    const [reportRefs, structuredSources, candidateResult, extractFailed] = await Promise.all([
-      type === 'all' || type === 'report_refs' ? this.reportReferenceSources(job) : Promise.resolve([]),
-      type === 'all' || type === 'structured_sources' ? this.structuredReportSources(job) : Promise.resolve([]),
-      type === 'all' || type === 'candidate_hits' ? this.candidateHitSources(job) : Promise.resolve({ items: [], total: 0, detailSaved: false }),
-      type === 'all' || type === 'extract_failed' ? this.extractFailedSources(job) : Promise.resolve([]),
+    const [reportRefs, structuredSources, toolSearchSources, candidateResult, extractFailed] = await Promise.all([
+      this.reportReferenceSources(job),
+      this.structuredReportSources(job),
+      this.toolSearchSources(job),
+      type === 'candidate_hits' ? this.candidateHitSources(job) : Promise.resolve({ items: [], total: 0, detailSaved: false }),
+      type === 'extract_failed' ? this.extractFailedSources(job) : Promise.resolve([]),
     ]);
 
+    const databaseRecall = this.databaseRecallChannelSources(structuredSources, reportRefs);
+    const toolSearch = this.toolSearchChannelSources(toolSearchSources, reportRefs, databaseRecall);
+    const summary: ReportSourceSummary = {
+      databaseRecallCount: databaseRecall.length,
+      toolSearchCount: toolSearch.length,
+      reportReferenceCount: reportRefs.length,
+      structuredSourceCount: structuredSources.length,
+    };
+
     const groups: Record<Exclude<ReportSourceListType, 'all'>, ReportSourceListItem[]> = {
+      database_recall: databaseRecall,
+      tool_search: toolSearch,
       report_refs: reportRefs,
       structured_sources: structuredSources,
       candidate_hits: candidateResult.items,
       extract_failed: extractFailed,
     };
-    const allItems = type === 'all' ? Object.values(groups).flat() : groups[type] || [];
+    const allItems = type === 'all' ? [...databaseRecall, ...toolSearch] : groups[type] || [];
     const total = type === 'candidate_hits'
       ? (candidateResult.total || allItems.length)
       : allItems.length;
@@ -716,14 +741,17 @@ export class ReportsService {
       pageSize,
       totalPages: Math.max(1, Math.ceil(total / pageSize)),
       hasMore: start + items.length < total && allItems.length > start + items.length,
-      meta: type === 'candidate_hits'
-        ? {
+      meta: {
+        summary,
+        ...(type === 'candidate_hits'
+          ? {
             detailSaved: candidateResult.detailSaved,
             message: candidateResult.detailSaved
               ? ''
               : `候选池共 ${total} 条，当前历史任务未保存候选明细。`,
           }
-        : undefined,
+          : {}),
+      },
     };
   }
 
@@ -1474,6 +1502,8 @@ export class ReportsService {
   private normalizeReportSourceType(type: unknown): ReportSourceListType {
     const normalized = String(type || '').trim();
     if (
+      normalized === 'database_recall' ||
+      normalized === 'tool_search' ||
       normalized === 'report_refs' ||
       normalized === 'structured_sources' ||
       normalized === 'candidate_hits' ||
@@ -1482,7 +1512,122 @@ export class ReportsService {
     ) {
       return normalized;
     }
-    return 'report_refs';
+    return 'all';
+  }
+
+  private databaseRecallChannelSources(
+    structuredSources: ReportSourceListItem[],
+    reportRefs: ReportSourceListItem[],
+  ): ReportSourceListItem[] {
+    const databaseItems = structuredSources.map((source) => ({
+      ...source,
+      sourceGroup: 'database_recall' as const,
+      sourceOrigin: 'database_recall' as const,
+      evidenceKind: source.evidenceKind || 'structured_source' as const,
+      engine: source.engine || this.inferDatabaseEngine(source),
+      sourceType: source.sourceType || '数据库记录',
+    }));
+    const databaseKeys = new Set(databaseItems.map((item) => this.sourceDedupeKey(item)).filter(Boolean));
+    const matchingRefs = reportRefs
+      .filter((ref) => databaseKeys.has(this.sourceDedupeKey(ref)))
+      .map((ref) => ({
+        ...ref,
+        sourceGroup: 'database_recall' as const,
+        sourceOrigin: 'database_recall' as const,
+        evidenceKind: 'report_reference' as const,
+        engine: this.inferDatabaseEngine(ref),
+      }));
+    return this.mergeReportSourceItems([...databaseItems, ...matchingRefs], 'database_recall');
+  }
+
+  private toolSearchChannelSources(
+    researchSources: ReportSourceListItem[],
+    reportRefs: ReportSourceListItem[],
+    databaseRecall: ReportSourceListItem[],
+  ): ReportSourceListItem[] {
+    const databaseKeys = new Set(databaseRecall.map((item) => this.sourceDedupeKey(item)).filter(Boolean));
+    const researchItems = researchSources.map((source) => ({
+      ...source,
+      sourceGroup: 'tool_search' as const,
+      sourceOrigin: 'tool_search' as const,
+      evidenceKind: source.evidenceKind || 'research_source' as const,
+      engine: source.engine || this.inferToolSearchEngine(source),
+    }));
+    const researchKeys = new Set(researchItems.map((item) => this.sourceDedupeKey(item)).filter(Boolean));
+    const publicRefs = reportRefs
+      .filter((ref) => {
+        const key = this.sourceDedupeKey(ref);
+        return !key || !databaseKeys.has(key) || researchKeys.has(key);
+      })
+      .map((ref) => ({
+        ...ref,
+        sourceGroup: 'tool_search' as const,
+        sourceOrigin: 'tool_search' as const,
+        evidenceKind: 'report_reference' as const,
+        engine: this.inferToolSearchEngine(ref),
+      }));
+    return this.mergeReportSourceItems([...researchItems, ...publicRefs], 'tool_search');
+  }
+
+  private mergeReportSourceItems(
+    items: ReportSourceListItem[],
+    sourceGroup: 'database_recall' | 'tool_search',
+  ): ReportSourceListItem[] {
+    const merged = new Map<string, ReportSourceListItem>();
+    for (const item of items) {
+      const key = this.sourceDedupeKey(item) || `${sourceGroup}:${item.id}`;
+      const existing = merged.get(key);
+      if (!existing) {
+        merged.set(key, { ...item, sourceGroup });
+        continue;
+      }
+      merged.set(key, {
+        ...existing,
+        citationNo: existing.citationNo ?? item.citationNo,
+        title: this.longerText(existing.title, item.title),
+        url: existing.url || item.url,
+        sourceName: existing.sourceName || item.sourceName,
+        publishTime: existing.publishTime || item.publishTime,
+        summary: this.longerText(existing.summary, item.summary),
+        excerpt: this.longerText(existing.excerpt, item.excerpt),
+        sourceType: existing.sourceType || item.sourceType,
+        relevanceScore: Math.max(existing.relevanceScore || 0, item.relevanceScore || 0) || undefined,
+        status: existing.status || item.status,
+        method: existing.method || item.method,
+        rawReferenceText: existing.rawReferenceText || item.rawReferenceText,
+        matchStatus: existing.matchStatus || item.matchStatus,
+        evidenceKind: existing.evidenceKind === 'report_reference' ? item.evidenceKind || existing.evidenceKind : existing.evidenceKind,
+        engine: existing.engine || item.engine,
+      });
+    }
+    return Array.from(merged.values()).sort((a, b) => (b.relevanceScore || 0) - (a.relevanceScore || 0));
+  }
+
+  private sourceDedupeKey(item: Partial<ReportSourceListItem>): string {
+    const url = this.normalizeSourceUrl(item.url);
+    if (url) return `url:${url}`;
+    const title = String(item.title || '').trim().toLowerCase();
+    const sourceName = String(item.sourceName || '').trim().toLowerCase();
+    return title ? `title:${title}|${sourceName}` : '';
+  }
+
+  private normalizeSourceUrl(value: unknown): string {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    try {
+      const parsed = new URL(raw);
+      parsed.hash = '';
+      parsed.searchParams.sort();
+      return parsed.toString().replace(/\/$/, '').toLowerCase();
+    } catch {
+      return raw.replace(/[?#].*$/, '').replace(/\/$/, '').toLowerCase();
+    }
+  }
+
+  private longerText(a?: string, b?: string): string {
+    const left = String(a || '');
+    const right = String(b || '');
+    return right.length > left.length ? right : left;
   }
 
   private async reportReferenceSources(job: JobRecord): Promise<ReportSourceListItem[]> {
@@ -1512,6 +1657,8 @@ export class ReportsService {
       return {
         id: `report-ref-${number}`,
         sourceGroup: 'report_refs',
+        sourceOrigin: undefined,
+        evidenceKind: 'report_reference',
         citationNo: number,
         title: reference?.title || fallback?.title || `\u53c2\u8003\u7f16\u53f7 [${number}]`,
         url: reference?.url || fallback?.url || '',
@@ -1579,6 +1726,7 @@ export class ReportsService {
       ...normalized,
       id: this.sanitizeLogText(normalized.id || `report-ref-${citationNo}`, 260),
       sourceGroup: 'report_refs',
+      evidenceKind: 'report_reference',
       citationNo,
       title,
       sourceType: normalized.sourceType || '\u62a5\u544a\u5f15\u7528',
@@ -1611,6 +1759,9 @@ export class ReportsService {
         excerpt: item.excerpt || '',
         rawReferenceText: item.rawReferenceText || '',
         sourceType: item.sourceType || '',
+        sourceOrigin: item.sourceOrigin || '',
+        evidenceKind: item.evidenceKind || '',
+        engine: item.engine || '',
         relevanceScore: item.relevanceScore,
         status: item.status || '',
         method: item.method || '',
@@ -1672,6 +1823,9 @@ export class ReportsService {
     return (data?.sources || []).map((source, index) => ({
       id: `structured-${source.url || source.title || index}`,
       sourceGroup: 'structured_sources',
+      sourceOrigin: 'database_recall',
+      evidenceKind: 'structured_source',
+      engine: data?.retrievalMode === 'vector' || data?.retrievalMode === 'hybrid' ? 'pg_vector' : 'database',
       title: source.title || source.url || '未命名信源',
       url: source.url || '',
       sourceName: source.websiteName || '',
@@ -1719,6 +1873,131 @@ export class ReportsService {
           sourceType: normalized.sourceType || '抽取失败',
         };
       });
+  }
+
+  private async toolSearchSources(job: JobRecord): Promise<ReportSourceListItem[]> {
+    const dir = this.remoteFs.joinPath(this.remoteFs.remoteDir, job.jobId);
+    if (!(await this.remoteFs.exists(dir))) return [];
+    const researchDir = this.remoteFs.joinPath(dir, 'research');
+    if (!(await this.remoteFs.exists(researchDir))) return [];
+
+    const rawItems: Array<{ item: unknown; evidenceKind: ReportEvidenceKind }> = [];
+    for (const filename of ['consolidated.json']) {
+      const parsed = await this.readJsonFile(this.remoteFs.joinPath(researchDir, filename));
+      rawItems.push(...this.extractToolSearchRawItems(parsed));
+    }
+
+    try {
+      const entries = await this.remoteFs.readdir(researchDir);
+      for (const entry of entries) {
+        if (!entry.isFile || !/^research_[a-z0-9_-]+\.json$/i.test(entry.name)) continue;
+        const parsed = await this.readJsonFile(this.remoteFs.joinPath(researchDir, entry.name));
+        rawItems.push(...this.extractToolSearchRawItems(parsed));
+        if (rawItems.length >= 300) break;
+      }
+    } catch {
+      // Missing research directory is a valid state for older or failed jobs.
+    }
+
+    const normalized = rawItems
+      .slice(0, 300)
+      .map(({ item, evidenceKind }, index) => this.normalizeToolSearchSourceItem(item, index, evidenceKind))
+      .filter((item): item is ReportSourceListItem => Boolean(item));
+    return this.mergeReportSourceItems(normalized, 'tool_search').slice(0, 300);
+  }
+
+  private extractToolSearchRawItems(value: unknown, depth = 0): Array<{ item: unknown; evidenceKind: ReportEvidenceKind }> {
+    if (!value || depth > 6) return [];
+    if (Array.isArray(value)) return value.flatMap((item) => this.extractToolSearchRawItems(item, depth + 1));
+    if (typeof value !== 'object') return [];
+
+    const record = value as Record<string, unknown>;
+    const result: Array<{ item: unknown; evidenceKind: ReportEvidenceKind }> = [];
+    for (const [key, candidate] of Object.entries(record)) {
+      const evidenceKind = this.evidenceKindForToolSearchKey(key);
+      if (evidenceKind && Array.isArray(candidate)) {
+        for (const item of candidate) {
+          if (this.isToolSearchRawItem(item)) result.push({ item, evidenceKind });
+        }
+      } else if (candidate && typeof candidate === 'object') {
+        result.push(...this.extractToolSearchRawItems(candidate, depth + 1));
+      }
+      if (result.length >= 300) break;
+    }
+    return result;
+  }
+
+  private evidenceKindForToolSearchKey(key: string): ReportEvidenceKind | null {
+    const normalized = key.toLowerCase();
+    if (normalized === 'sources' || normalized === 'source_list') return 'research_source';
+    if (normalized === 'documents') return 'research_source';
+    if (normalized === 'evidence_cards' || normalized === 'evidencecards') return 'evidence_card';
+    if (normalized === 'key_findings' || normalized === 'keyfindings' || normalized === 'verification_needed') return 'evidence_card';
+    return null;
+  }
+
+  private isToolSearchRawItem(item: unknown): boolean {
+    if (!item || typeof item !== 'object') return false;
+    const source = item as Record<string, unknown>;
+    const haystack = [
+      this.firstString(source, ['engine', 'search_engine', 'provider']),
+      this.firstString(source, ['method', 'retrievalMode', 'collection_method', 'mode']),
+      this.firstString(source, ['source_type', 'type', 'sourceType']),
+      this.firstString(source, ['url', 'source_url', 'data_source_url', 'sourceUrl']),
+    ].join(' ').toLowerCase();
+    return /\b(exa|firecrawl|tavily|tavily_extract)\b/.test(haystack);
+  }
+
+  private normalizeToolSearchSourceItem(
+    item: unknown,
+    index: number,
+    evidenceKind: ReportEvidenceKind,
+  ): ReportSourceListItem | null {
+    if (!item || typeof item !== 'object') return null;
+    const source = item as Record<string, unknown>;
+    const normalized = this.normalizeSourceRecord(source, index, 'tool_search');
+    const engine = this.inferToolSearchEngine(normalized, source);
+    if (!engine) return null;
+    return {
+      ...normalized,
+      sourceGroup: 'tool_search',
+      sourceOrigin: 'tool_search',
+      evidenceKind,
+      engine,
+      sourceType: this.toolSearchSourceTypeLabel(engine),
+      status: normalized.status || this.firstString(source, ['success']) || 'collected',
+      method: normalized.method || this.toolSearchMethodLabel(engine),
+    };
+  }
+
+  private inferDatabaseEngine(item: Partial<ReportSourceListItem>, raw?: Record<string, unknown>): ReportSourceEngine {
+    const text = `${item.engine || ''} ${item.sourceType || ''} ${item.method || ''} ${raw ? JSON.stringify(raw).slice(0, 500) : ''}`.toLowerCase();
+    return /pg|vector|向量/.test(text) ? 'pg_vector' : 'database';
+  }
+
+  private inferToolSearchEngine(item: Partial<ReportSourceListItem>, raw?: Record<string, unknown>): ReportSourceEngine | undefined {
+    const text = `${item.engine || ''} ${item.sourceType || ''} ${item.method || ''} ${item.url || ''} ${raw ? JSON.stringify(raw).slice(0, 500) : ''}`.toLowerCase();
+    if (/tavily_extract/.test(text)) return 'tavily_extract';
+    if (/\bfirecrawl\b/.test(text)) return 'firecrawl';
+    if (/\btavily\b/.test(text)) return 'tavily';
+    if (/\bexa\b/.test(text)) return 'exa';
+    return undefined;
+  }
+
+  private toolSearchSourceTypeLabel(engine?: ReportSourceEngine): string {
+    if (engine === 'exa') return 'Exa搜索';
+    if (engine === 'firecrawl') return 'Firecrawl抽取';
+    if (engine === 'tavily_extract') return 'Tavily抽取';
+    if (engine === 'tavily') return 'Tavily搜索';
+    return '工具调用搜索';
+  }
+
+  private toolSearchMethodLabel(engine?: ReportSourceEngine): string {
+    if (engine === 'exa') return 'Exa 语义搜索';
+    if (engine === 'firecrawl') return 'Firecrawl 内容抽取';
+    if (engine === 'tavily_extract') return 'Tavily Extract 内容抽取';
+    if (engine === 'tavily') return 'Tavily 实时搜索';
+    return '工具调用搜索';
   }
 
   private candidateHitTotal(data: DatabaseSourcesResponse | undefined): number {
@@ -1778,11 +2057,12 @@ export class ReportsService {
     const url = this.firstString(source, ['url', 'source_url', 'data_source_url', 'sourceUrl']);
     const sourceName = this.firstString(source, ['publisher', 'website_name', 'source_name', 'site_name', 'sourceName', 'websiteName']);
     const publishTime = this.firstString(source, ['published_at', 'publish_time', 'pub_time', 'source_time', 'publishTime', 'publishedAt', 'time']);
-    const summary = this.firstString(source, ['summary', 'abstract', 'description']);
-    const excerpt = this.firstString(source, ['excerpt', 'content_excerpt', 'chunk_text', 'content_chunk', 'body', 'content']);
+    const summary = this.firstString(source, ['summary', 'abstract', 'description', 'snippet', 'finding', 'claim', 'content_preview']);
+    const excerpt = this.firstString(source, ['excerpt', 'content_excerpt', 'chunk_text', 'content_chunk', 'body', 'content', 'markdown', 'content_preview']);
     const sourceType = this.firstString(source, ['source_type', 'type', 'tag', 'designated_tag', 'sourceType']);
-    const score = this.firstNumber(source, ['relevance_score', 'relevanceScore', 'score', 'similarity', 'rank_score']);
+    const score = this.firstNumber(source, ['relevance_score', 'relevanceScore', 'score', 'similarity', 'rank_score', 'credibility_score']);
     const id = this.firstString(source, ['id', 'sourceId', 'source_id', 'mysql_id']) || `${sourceGroup}-${url || title || index}`;
+    const engine = this.firstString(source, ['engine', 'search_engine', 'provider']);
     return {
       id: this.sanitizeLogText(id, 260),
       sourceGroup,
@@ -1796,6 +2076,7 @@ export class ReportsService {
       relevanceScore: score,
       status: this.sanitizeLogText(this.firstString(source, ['status', 'extract_status', 'source_status']), 80),
       method: this.sanitizeLogText(this.firstString(source, ['method', 'retrievalMode', 'collection_method']), 120),
+      engine: this.sanitizeLogText(engine, 40) as ReportSourceEngine,
     };
   }
 
