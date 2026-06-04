@@ -454,7 +454,7 @@ export class OpenClawService {
     return [
       '请根据以下对话回答最后一个用户问题。',
       '检索规程：必须优先使用 pg-sources__query 检索 PostgreSQL 信源库，不要先使用 MySQL；不要查询 documents、news、articles 等臆测表名。',
-      'PostgreSQL 当前主要信源表是 public.vector_materials_qwen3；如需确认结构，先查询 information_schema.columns。常用字段包括 ch_title、entitle、data_source_url、website_name、publish_time、summary、content、embedding_text、embedding_model、embedding_vector。',
+      'PostgreSQL 当前主要信源表是 public.vector_materials_text_embedding_v4；如需确认结构，先查询 information_schema.columns。常用字段包括 ch_title、entitle、data_source_url、website_name、publish_time、summary、content、embedding_text、embedding_model、embedding_vector。',
       'PG 检索时至少返回 ch_title、data_source_url、website_name、publish_time、summary；优先在 ch_title、summary、content、embedding_text 中围绕用户问题的关键词和同义词检索，并按 publish_time DESC 排序。不要使用不存在的 title、source、published_at 字段。',
       '如果 pg-sources__query 返回空结果或表结构不满足需求，可以再用 mysql-test__mysql_query 作为补充检索；补充检索结果也必须保留 ch_title、data_source_url、website_name、publish_time、summary 等来源字段。',
       '回答必须基于检索到的信源资料进行归纳。资料不足时，请明确说明当前信源库未检索到足够信息，不要编造细节。',
@@ -713,7 +713,7 @@ export class OpenClawService {
     maxContentRows: number;
     mcpServer: 'pg-sources';
     storageMode: 'pgvector_single_table';
-    sourceTable: 'vector_materials_qwen3';
+    sourceTable: 'vector_materials_text_embedding_v4';
   } {
     const options = value && typeof value === 'object' && !Array.isArray(value)
       ? (value as Record<string, unknown>)
@@ -732,7 +732,7 @@ export class OpenClawService {
       maxContentRows: boundedInt(options.maxContentRows, 8, 0, 20),
       mcpServer: 'pg-sources',
       storageMode: 'pgvector_single_table',
-      sourceTable: 'vector_materials_qwen3',
+      sourceTable: 'vector_materials_text_embedding_v4',
     };
   }
 
@@ -909,7 +909,7 @@ export class OpenClawService {
     const databaseSourceRequirements = databaseSourceOptions.enabled
       ? [
           `18. databaseSourceOptions.enabled=true 时，Research Phase 必须先读取 context.json.databaseQueryIntent 分词词包，再在公开检索前调用 MCP 工具 pg-sources__query 检索 PostgreSQL 向量信源库；配置为 summary_first、storageMode=${databaseSourceOptions.storageMode}、sourceTable=public.${databaseSourceOptions.sourceTable}、lookbackDays=${databaseSourceOptions.lookbackDays}、maxMetadataRows=${databaseSourceOptions.maxMetadataRows}、maxContentRows=${databaseSourceOptions.maxContentRows}。`,
-          '19. PG 信源库当前主表是 public.vector_materials_qwen3；如需确认结构，只能先查询 information_schema.columns。不要查询 documents、news、articles 或 news.data_YYYYMMDD 等臆测表名，不要把 MySQL 当作默认入口；任何数据库操作都必须是只读 SELECT，不得执行 INSERT/UPDATE/DELETE/DDL。',
+          '19. PG 信源库当前主表是 public.vector_materials_text_embedding_v4；如需确认结构，只能先查询 information_schema.columns。不要查询 documents、news、articles 或 news.data_YYYYMMDD 等臆测表名，不要把 MySQL 当作默认入口；任何数据库操作都必须是只读 SELECT，不得执行 INSERT/UPDATE/DELETE/DDL。',
           '20. PG 首轮检索必须围绕 databaseQueryIntent.primaryPhrases、entityTerms、actionTerms、domainTerms、ngrams，在 ch_title、entitle、summary、content、embedding_text 中组织关键词、同义词和语义召回；优先返回 ch_title、entitle、data_source_url、website_name、publish_time、summary，可在内部读取有限 content/embedding_text 摘要用于相关性判断；严禁读取或输出 embedding_vector、raw_data、连接信息。',
           `21. PG 命中结果必须单独保存为 database/database_sources.json 和 database/database_query_plan.json。database_sources.json 每条记录必须保留原始展示字段：ch_title（中文标题）、data_source_url（信源链接）、summary（摘要）、website_name（来源站点名称）、publish_time（发布时间）；可附带内部字段如 relevance_score、similarity、relevance_reason、needs_verification、source_type='pg_vector'。database_query_plan 必须记录 retrieval_mode='pg_vector'、mcp_server='pg-sources'、storageMode、sourceTable、embeddingModel（如可得）、indexedRows（如可得）、vector_hits/total_hits、returned_sources、使用词包和 database_source_fallback_reason。`,
           '22. 如果 pg-sources__query 返回空结果、表结构不满足需求、SQL 报错或权限不足，必须在 database_query_plan.json 中写入 database_source_fallback_reason 字段（值为字符串，说明具体回退原因）；只有在该字段已记录后，才可用 mysql-test__mysql_query 作为补充兜底检索，并在 plan 中记录 fallback_mcp="mysql-test"。无论是否回退，都不得让编报任务失败，也不得因此缩减公网调研流程。',

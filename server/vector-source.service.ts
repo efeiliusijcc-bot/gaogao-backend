@@ -1,4 +1,4 @@
-import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+﻿import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import crypto from 'crypto';
 import { createRequire } from 'module';
 import OpenAI from 'openai';
@@ -27,8 +27,11 @@ export interface VectorSourceItem {
 export interface VectorQueryPlan {
   enabled: boolean;
   available: boolean;
+  activeProfile: string;
+  availableProfiles: Array<{ key: string; label: string; sourceTable: string; embeddingModel: string; embeddingDimensions: number }>;
   storageMode: 'pgvector_chunks' | 'legacy_vector_materials' | 'pgvector_single_table' | 'unavailable';
   embeddingModel: string;
+  embeddingDimensions: number;
   indexTable: string;
   activeTable: string;
   sourceTable: string;
@@ -60,15 +63,58 @@ interface VectorSearchInput {
 
 const require = createRequire(import.meta.url);
 const QWEN3_EMBEDDING_MODEL = 'Qwen3-Embedding-0.6B-Q8';
-const EMBEDDING_MODEL = process.env.PGVECTOR_EMBEDDING_MODEL || 'text-embedding-3-small';
-const EMBEDDING_DIMENSIONS = Math.max(1, Number(process.env.PGVECTOR_EMBEDDING_DIMENSIONS || defaultEmbeddingDimensions(EMBEDDING_MODEL)));
-const EMBEDDING_BASE_URL = process.env.PGVECTOR_EMBEDDING_BASE_URL || process.env.OPENAI_BASE_URL || '';
-const OMIT_EMBEDDING_DIMENSIONS = process.env.PGVECTOR_OMIT_EMBEDDING_DIMENSIONS === '1';
-const EMBEDDING_INPUT_CHARS = Math.max(
-  1,
-  Math.min(32768, Number(process.env.PGVECTOR_EMBEDDING_INPUT_CHARS || (EMBEDDING_MODEL === 'text-embedding-v2' ? 1800 : isQwen3EmbeddingModel(EMBEDDING_MODEL) ? 600 : 8000))),
-);
-const SOURCE_TABLE = process.env.PGVECTOR_NEWS_TABLE || 'news';
+interface VectorProfileConfig {
+  profile: 'text-embedding-v4' | 'qwen3-0.6b';
+  label: string;
+  sourceTable: string;
+  embeddingModel: string;
+  embeddingDimensions: number;
+  embeddingBaseUrl: string;
+  embeddingInputChars: number;
+  omitEmbeddingDimensions: boolean;
+}
+
+const VECTOR_PROFILES: Record<VectorProfileConfig['profile'], VectorProfileConfig> = {
+  'text-embedding-v4': {
+    profile: 'text-embedding-v4',
+    label: 'text-embedding-v4',
+    sourceTable: 'vector_materials_text_embedding_v4',
+    embeddingModel: 'text-embedding-v4',
+    embeddingDimensions: 1024,
+    embeddingBaseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    embeddingInputChars: 600,
+    omitEmbeddingDimensions: false,
+  },
+  'qwen3-0.6b': {
+    profile: 'qwen3-0.6b',
+    label: 'Qwen3-Embedding-0.6B-Q8',
+    sourceTable: 'vector_materials_qwen3',
+    embeddingModel: QWEN3_EMBEDDING_MODEL,
+    embeddingDimensions: 1024,
+    embeddingBaseUrl: 'http://69.165.75.20:8080/v1',
+    embeddingInputChars: 600,
+    omitEmbeddingDimensions: false,
+  },
+};
+
+function envVectorProfile(): VectorProfileConfig {
+  const model = process.env.PGVECTOR_EMBEDDING_MODEL || '';
+  const table = process.env.PGVECTOR_NEWS_TABLE || '';
+  const base = model.includes('Qwen3') || table === 'vector_materials_qwen3'
+    ? VECTOR_PROFILES['qwen3-0.6b']
+    : VECTOR_PROFILES['text-embedding-v4'];
+  return {
+    ...base,
+    sourceTable: process.env.PGVECTOR_NEWS_TABLE || base.sourceTable,
+    embeddingModel: process.env.PGVECTOR_EMBEDDING_MODEL || base.embeddingModel,
+    embeddingDimensions: Math.max(1, Number(process.env.PGVECTOR_EMBEDDING_DIMENSIONS || base.embeddingDimensions)),
+    embeddingBaseUrl: process.env.PGVECTOR_EMBEDDING_BASE_URL || process.env.OPENAI_BASE_URL || base.embeddingBaseUrl,
+    embeddingInputChars: Math.max(1, Math.min(32768, Number(process.env.PGVECTOR_EMBEDDING_INPUT_CHARS || base.embeddingInputChars))),
+    omitEmbeddingDimensions: process.env.PGVECTOR_OMIT_EMBEDDING_DIMENSIONS === '1' || base.omitEmbeddingDimensions,
+  };
+}
+
+let ACTIVE_VECTOR_CONFIG: VectorProfileConfig = envVectorProfile();
 const INDEX_TABLE = process.env.PGVECTOR_INDEX_TABLE || 'news_vector_chunks';
 const INDEX_INTERVAL_MS = Math.max(60_000, Number(process.env.PGVECTOR_INDEX_INTERVAL_MS || 600_000));
 const INDEX_BATCH_SIZE = Math.max(1, Math.min(500, Number(process.env.PGVECTOR_INDEX_BATCH_SIZE || 100)));
@@ -116,17 +162,41 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
     if (this.pool) await this.pool.end();
   }
 
+  profiles() {
+    return {
+      activeProfile: ACTIVE_VECTOR_CONFIG.profile,
+      items: Object.values(VECTOR_PROFILES).map((profile) => ({
+        key: profile.profile,
+        label: profile.label,
+        sourceTable: profile.sourceTable,
+        embeddingModel: profile.embeddingModel,
+        embeddingDimensions: profile.embeddingDimensions,
+      })),
+    };
+  }
+
+  async switchProfile(profileKey: string): Promise<VectorQueryPlan> {
+    const next = VECTOR_PROFILES[profileKey as VectorProfileConfig['profile']];
+    if (!next) throw new Error(`Unsupported vector profile: ${profileKey}`);
+    ACTIVE_VECTOR_CONFIG = { ...next };
+    await this.resetRuntimeState();
+    return this.status();
+  }
+
   async status(): Promise<VectorQueryPlan> {
     const available = await this.ensureReady();
     const stats = available ? await this.indexStats() : { indexedRows: 0, lastIndexedAt: null };
     return {
       enabled: Boolean(this.databaseUrl()),
       available,
+      activeProfile: ACTIVE_VECTOR_CONFIG.profile,
+      availableProfiles: this.profiles().items,
       storageMode: available ? this.storageMode : 'unavailable',
-      embeddingModel: EMBEDDING_MODEL,
+      embeddingModel: ACTIVE_VECTOR_CONFIG.embeddingModel,
+      embeddingDimensions: ACTIVE_VECTOR_CONFIG.embeddingDimensions,
       indexTable: this.storageMode === 'pgvector_chunks' ? INDEX_TABLE : '',
-      activeTable: this.storageMode === 'pgvector_chunks' ? INDEX_TABLE : SOURCE_TABLE,
-      sourceTable: SOURCE_TABLE,
+      activeTable: this.storageMode === 'pgvector_chunks' ? INDEX_TABLE : ACTIVE_VECTOR_CONFIG.sourceTable,
+      sourceTable: ACTIVE_VECTOR_CONFIG.sourceTable,
       embeddingColumnType: this.embeddingColumnType,
       pgvectorAvailable: this.pgvectorAvailable,
       indexedRows: stats.indexedRows,
@@ -137,6 +207,20 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
       lastIndexedAt: stats.lastIndexedAt || this.lastIndexedAt,
       fallbackReason: available ? this.legacyFallbackReason : this.lastError || 'PGVECTOR_DATABASE_URL is not configured',
     };
+  }
+
+  private async resetRuntimeState(): Promise<void> {
+    this.initPromise = null;
+    this.supportsPgVector = false;
+    this.supportsSourceEmbeddingText = false;
+    this.supportsSourceEmbeddingVector = false;
+    this.storageMode = 'unavailable';
+    this.embeddingColumnType = '';
+    this.pgvectorAvailable = false;
+    this.legacyFallbackReason = '';
+    this.lastError = '';
+    this.lastIndexedAt = null;
+    this.lastIndexStats = { indexed: 0, skipped: 0 };
   }
 
   async reindex(limit = INDEX_BATCH_SIZE): Promise<VectorQueryPlan> {
@@ -240,7 +324,7 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
     const limit = Math.max(1, Math.min(1000, options.limit || INDEX_BATCH_SIZE));
     const rows = await pool.query(
       `SELECT ${selectList}
-         FROM ${this.qi(SOURCE_TABLE)} n
+         FROM ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} n
         WHERE NOT EXISTS (
           SELECT 1 FROM ${this.qi(INDEX_TABLE)} v
            WHERE v.source_key = ${sourceKeyExpr}
@@ -249,7 +333,7 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
         )
         ORDER BY ${freshnessExpr} DESC NULLS LAST
         LIMIT $2`,
-      [EMBEDDING_MODEL, limit],
+      [ACTIVE_VECTOR_CONFIG.embeddingModel, limit],
     );
 
     const candidates = rows.rows
@@ -296,7 +380,7 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
           item.summary,
           item.chunkText,
           this.toVectorLiteral(embedding),
-          EMBEDDING_MODEL,
+          ACTIVE_VECTOR_CONFIG.embeddingModel,
         ],
       );
       indexed += 1;
@@ -324,14 +408,14 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
   private async initialize(): Promise<boolean> {
     const pool = await this.getPool();
     const columns = await this.discoverNewsColumns();
-    const embeddingMeta = await this.discoverColumnMeta(SOURCE_TABLE, columns.embedding);
+    const embeddingMeta = await this.discoverColumnMeta(ACTIVE_VECTOR_CONFIG.sourceTable, columns.embedding);
     this.embeddingColumnType = embeddingMeta
       ? [embeddingMeta.dataType, embeddingMeta.udtName].filter(Boolean).join('/')
       : '';
     const available = await pool.query(`SELECT 1 FROM pg_available_extensions WHERE name = 'vector' LIMIT 1`);
     this.pgvectorAvailable = Boolean(available.rows.length);
 
-    if (SOURCE_TABLE.startsWith('vector_materials') && columns.embedding) {
+    if (ACTIVE_VECTOR_CONFIG.sourceTable.startsWith('vector_materials') && columns.embedding) {
       this.supportsPgVector = Boolean(this.pgvectorAvailable && columns.embeddingVector);
       this.supportsSourceEmbeddingText = true;
       this.supportsSourceEmbeddingVector = Boolean(this.supportsPgVector);
@@ -378,7 +462,7 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
         source_time timestamptz,
         summary text,
         chunk_text text NOT NULL,
-        embedding vector(${EMBEDDING_DIMENSIONS}) NOT NULL,
+        embedding vector(${ACTIVE_VECTOR_CONFIG.embeddingDimensions}) NOT NULL,
         embedding_model text NOT NULL,
         indexed_at timestamptz NOT NULL DEFAULT now(),
         UNIQUE (source_key, embedding_model)
@@ -420,7 +504,7 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
          FROM information_schema.columns
         WHERE table_name = $1
           AND table_schema = ANY (current_schemas(false))`,
-      [SOURCE_TABLE],
+      [ACTIVE_VECTOR_CONFIG.sourceTable],
     );
     const available = new Set(result.rows.map((row) => String(row.column_name)));
     const pick = (...names: string[]) => names.find((name) => available.has(name)) || '';
@@ -464,35 +548,35 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
 
   private async ensureLegacyVectorMaterialsSchema(): Promise<void> {
     const pool = await this.getPool();
-    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS mysql_database text`);
-    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS mysql_table_name text`);
-    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS entitle text`);
-    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS data_source_url text`);
-    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS website_name text`);
-    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS tag text`);
-    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS content text`);
-    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS content_excerpt text`);
-    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS embedding_text text`);
-    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS content_hash text`);
-    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS embedding_model text`);
+    await pool.query(`ALTER TABLE ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} ADD COLUMN IF NOT EXISTS mysql_database text`);
+    await pool.query(`ALTER TABLE ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} ADD COLUMN IF NOT EXISTS mysql_table_name text`);
+    await pool.query(`ALTER TABLE ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} ADD COLUMN IF NOT EXISTS entitle text`);
+    await pool.query(`ALTER TABLE ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} ADD COLUMN IF NOT EXISTS data_source_url text`);
+    await pool.query(`ALTER TABLE ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} ADD COLUMN IF NOT EXISTS website_name text`);
+    await pool.query(`ALTER TABLE ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} ADD COLUMN IF NOT EXISTS tag text`);
+    await pool.query(`ALTER TABLE ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} ADD COLUMN IF NOT EXISTS content text`);
+    await pool.query(`ALTER TABLE ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} ADD COLUMN IF NOT EXISTS content_excerpt text`);
+    await pool.query(`ALTER TABLE ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} ADD COLUMN IF NOT EXISTS embedding_text text`);
+    await pool.query(`ALTER TABLE ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} ADD COLUMN IF NOT EXISTS content_hash text`);
+    await pool.query(`ALTER TABLE ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} ADD COLUMN IF NOT EXISTS embedding_model text`);
     if (this.pgvectorAvailable) {
-      await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS embedding_vector vector(${EMBEDDING_DIMENSIONS})`);
-      await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS embedding_dimensions integer`);
+      await pool.query(`ALTER TABLE ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} ADD COLUMN IF NOT EXISTS embedding_vector vector(${ACTIVE_VECTOR_CONFIG.embeddingDimensions})`);
+      await pool.query(`ALTER TABLE ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} ADD COLUMN IF NOT EXISTS embedding_dimensions integer`);
     }
-    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS indexed_at timestamptz`);
-    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS vector_status text`);
-    await pool.query(`ALTER TABLE ${this.qi(SOURCE_TABLE)} ADD COLUMN IF NOT EXISTS error_message text`);
+    await pool.query(`ALTER TABLE ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} ADD COLUMN IF NOT EXISTS indexed_at timestamptz`);
+    await pool.query(`ALTER TABLE ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} ADD COLUMN IF NOT EXISTS vector_status text`);
+    await pool.query(`ALTER TABLE ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} ADD COLUMN IF NOT EXISTS error_message text`);
     await pool.query(
-      `CREATE UNIQUE INDEX IF NOT EXISTS ${this.qi(`${SOURCE_TABLE}_mysql_source_uidx`)}
-         ON ${this.qi(SOURCE_TABLE)} (mysql_database, mysql_table_name, mysql_id, embedding_model)`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS ${this.qi(`${ACTIVE_VECTOR_CONFIG.sourceTable}_mysql_source_uidx`)}
+         ON ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} (mysql_database, mysql_table_name, mysql_id, embedding_model)`,
     );
     await pool.query(
-      `CREATE INDEX IF NOT EXISTS ${this.qi(`${SOURCE_TABLE}_publish_time_idx`)}
-         ON ${this.qi(SOURCE_TABLE)} (publish_time DESC NULLS LAST)`,
+      `CREATE INDEX IF NOT EXISTS ${this.qi(`${ACTIVE_VECTOR_CONFIG.sourceTable}_publish_time_idx`)}
+         ON ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} (publish_time DESC NULLS LAST)`,
     );
     await pool.query(
-      `CREATE INDEX IF NOT EXISTS ${this.qi(`${SOURCE_TABLE}_indexed_at_idx`)}
-         ON ${this.qi(SOURCE_TABLE)} (indexed_at DESC NULLS LAST)`,
+      `CREATE INDEX IF NOT EXISTS ${this.qi(`${ACTIVE_VECTOR_CONFIG.sourceTable}_indexed_at_idx`)}
+         ON ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} (indexed_at DESC NULLS LAST)`,
     );
   }
 
@@ -500,8 +584,8 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
     const pool = await this.getPool();
     try {
       await pool.query(
-        `CREATE INDEX IF NOT EXISTS ${this.qi(`${SOURCE_TABLE}_embedding_hnsw_idx`)}
-           ON ${this.qi(SOURCE_TABLE)}
+        `CREATE INDEX IF NOT EXISTS ${this.qi(`${ACTIVE_VECTOR_CONFIG.sourceTable}_embedding_hnsw_idx`)}
+           ON ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)}
         USING hnsw (embedding_vector vector_cosine_ops)`,
       );
     } catch (error) {
@@ -620,7 +704,7 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
     const params: unknown[] = [Math.max(input.maxRows * 20, 300)];
     let where = `WHERE n.${this.qi(columns.embedding)} IS NOT NULL`;
     if (columns.embeddingModel) {
-      params.push(EMBEDDING_MODEL);
+      params.push(ACTIVE_VECTOR_CONFIG.embeddingModel);
       where += ` AND n.${this.qi(columns.embeddingModel)} = $${params.length}`;
     }
     const rows = await pool.query(
@@ -635,7 +719,7 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
               ${columns.publishTime ? `n.${this.qi(columns.publishTime)}::timestamptz` : 'NULL::timestamptz'} AS publish_time,
               ${freshnessExpr} AS source_time,
               n.${this.qi(columns.embedding)}::text AS embedding
-         FROM ${this.qi(SOURCE_TABLE)} n
+         FROM ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} n
         ${where}
         ORDER BY ${freshnessExpr} DESC NULLS LAST
         LIMIT $1`,
@@ -680,7 +764,7 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
     const params: unknown[] = [vector, Math.max(input.maxRows * 4, 80)];
     let where = `WHERE n.${this.qi(columns.embeddingVector)} IS NOT NULL`;
     if (columns.embeddingModel) {
-      params.push(EMBEDDING_MODEL);
+      params.push(ACTIVE_VECTOR_CONFIG.embeddingModel);
       where += ` AND n.${this.qi(columns.embeddingModel)} = $${params.length}`;
     }
     const freshness = this.safeLookbackDays(input.lookbackDays);
@@ -700,7 +784,7 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
               ${columns.publishTime ? `n.${this.qi(columns.publishTime)}::timestamptz` : 'NULL::timestamptz'} AS publish_time,
               ${freshnessExpr} AS source_time,
               1 - (n.${this.qi(columns.embeddingVector)} <=> $1::vector) AS similarity
-         FROM ${this.qi(SOURCE_TABLE)} n
+         FROM ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)} n
         ${where}
         ORDER BY n.${this.qi(columns.embeddingVector)} <=> $1::vector
         LIMIT $2`,
@@ -784,11 +868,11 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async embedTexts(apiKey: string, texts: string[]): Promise<number[][]> {
-    const client = new OpenAI({ apiKey, ...(EMBEDDING_BASE_URL ? { baseURL: EMBEDDING_BASE_URL } : {}) });
+    const client = new OpenAI({ apiKey, ...(ACTIVE_VECTOR_CONFIG.embeddingBaseUrl ? { baseURL: ACTIVE_VECTOR_CONFIG.embeddingBaseUrl } : {}) });
     const response = await client.embeddings.create({
-      model: EMBEDDING_MODEL,
-      input: texts.map((text) => text.slice(0, EMBEDDING_INPUT_CHARS)),
-      ...(!OMIT_EMBEDDING_DIMENSIONS && EMBEDDING_DIMENSIONS ? { dimensions: EMBEDDING_DIMENSIONS } : {}),
+      model: ACTIVE_VECTOR_CONFIG.embeddingModel,
+      input: texts.map((text) => text.slice(0, ACTIVE_VECTOR_CONFIG.embeddingInputChars)),
+      ...(!ACTIVE_VECTOR_CONFIG.omitEmbeddingDimensions && ACTIVE_VECTOR_CONFIG.embeddingDimensions ? { dimensions: ACTIVE_VECTOR_CONFIG.embeddingDimensions } : {}),
     });
     return response.data.map((item) => item.embedding);
   }
@@ -807,12 +891,12 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
         const params: unknown[] = [];
         let where = `WHERE ${this.qi(columns.embeddingVector)} IS NOT NULL`;
         if (columns.embeddingModel) {
-          params.push(EMBEDDING_MODEL);
+          params.push(ACTIVE_VECTOR_CONFIG.embeddingModel);
           where += ` AND ${this.qi(columns.embeddingModel)} = $${params.length}`;
         }
         const result = await pool.query(
           `SELECT count(*)::int AS count, max(${freshness}) AS last_indexed_at
-             FROM ${this.qi(SOURCE_TABLE)}
+             FROM ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)}
             ${where}`,
           params,
         );
@@ -828,12 +912,12 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
         const params: unknown[] = [];
         let where = `WHERE ${this.qi(columns.embedding)} IS NOT NULL`;
         if (columns.embeddingModel) {
-          params.push(EMBEDDING_MODEL);
+          params.push(ACTIVE_VECTOR_CONFIG.embeddingModel);
           where += ` AND ${this.qi(columns.embeddingModel)} = $${params.length}`;
         }
         const result = await pool.query(
           `SELECT count(*)::int AS count, max(${freshness}) AS last_indexed_at
-             FROM ${this.qi(SOURCE_TABLE)}
+             FROM ${this.qi(ACTIVE_VECTOR_CONFIG.sourceTable)}
             ${where}`,
           params,
         );
@@ -846,7 +930,7 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
         `SELECT count(*)::int AS count, max(indexed_at) AS last_indexed_at
            FROM ${this.qi(INDEX_TABLE)}
           WHERE embedding_model = $1`,
-        [EMBEDDING_MODEL],
+        [ACTIVE_VECTOR_CONFIG.embeddingModel],
       );
       return {
         indexedRows: Number(result.rows[0]?.count || 0),
@@ -866,11 +950,14 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
       queryPlan: {
         enabled: Boolean(this.databaseUrl()),
         available: status !== 'unavailable',
+        activeProfile: ACTIVE_VECTOR_CONFIG.profile,
+        availableProfiles: this.profiles().items,
         storageMode: status !== 'unavailable' ? this.storageMode : 'unavailable',
-        embeddingModel: EMBEDDING_MODEL,
+        embeddingModel: ACTIVE_VECTOR_CONFIG.embeddingModel,
+        embeddingDimensions: ACTIVE_VECTOR_CONFIG.embeddingDimensions,
         indexTable: this.storageMode === 'pgvector_chunks' ? INDEX_TABLE : '',
-        activeTable: this.storageMode === 'pgvector_chunks' ? INDEX_TABLE : SOURCE_TABLE,
-        sourceTable: SOURCE_TABLE,
+        activeTable: this.storageMode === 'pgvector_chunks' ? INDEX_TABLE : ACTIVE_VECTOR_CONFIG.sourceTable,
+        sourceTable: ACTIVE_VECTOR_CONFIG.sourceTable,
         embeddingColumnType: this.embeddingColumnType,
         pgvectorAvailable: this.pgvectorAvailable,
         indexedRows: 0,
@@ -912,3 +999,6 @@ export class VectorSourceService implements OnModuleInit, OnModuleDestroy {
       .slice(0, 300);
   }
 }
+
+
+

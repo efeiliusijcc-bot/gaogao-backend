@@ -1158,8 +1158,11 @@ export class ReportsService {
       queryPlan: rawPlan || {
         enabled: false,
         available: false,
+        activeProfile: '',
+        availableProfiles: [],
         storageMode: 'unavailable',
         embeddingModel: '',
+        embeddingDimensions: 0,
         indexTable: '',
         activeTable: '',
         sourceTable: '',
