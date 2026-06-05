@@ -146,6 +146,7 @@ export class ChatService {
       messages: this.buildPgGroundedMessages(messages, sources),
       stream: true,
       temperature: 0.2,
+      max_tokens: this.directAnswerMaxTokens(messages),
     });
 
     let text = '';
@@ -168,32 +169,39 @@ export class ChatService {
 
   private buildPgGroundedMessages(messages: ChatRequest['messages'], sources: Record<string, unknown>[]): ChatRequest['messages'] {
     const originalSystem = messages.find((item) => item.role === 'system')?.content || '';
-    const conversation = messages.filter((item) => item.role !== 'system').slice(-8);
+    const conversation = messages.filter((item) => item.role !== 'system').slice(-6);
+    const answerLength = this.directAnswerMaxTokens(messages) > 900 ? '900-1400 字' : '400-800 字';
     const sourceBlock = sources.length
       ? sources.map((source, index) => {
           return [
             `[${index + 1}] ${source.title || '未命名信源'}`,
             `来源：${source.websiteName || '未知'} ${source.publishTime || ''}`,
-            `摘要：${source.summary || source.contentExcerpt || '暂无摘要'}`,
+            `摘要：${this.clean(String(source.summary || source.contentExcerpt || '暂无摘要'), 260)}`,
             source.url ? `链接：${source.url}` : '',
           ].filter(Boolean).join('\n');
         }).join('\n\n')
-      : '本次 PG 向量召回未检索到足够匹配材料。';
+      : '本次检索未找到足够匹配材料。';
 
     return [
       {
         role: 'system',
         content: [
           originalSystem,
-          '你是热点事件动态感知助手。必须优先依据下方 PG 向量召回材料回答；如果材料不足，要明确说明“PG 信源库未检索到足够信息”，不要编造事实。',
-          '回答要求：先给结论，再列关键依据；用中文，简洁直接；不要提及 SQL、表名、MCP、向量、模型、接口、系统实现或检索过程。',
+          '你是热点事件动态感知助手。必须优先依据下方参考材料回答；材料不足时要明确说明“现有材料不足以确认”，不要编造事实。',
+          `回答要求：使用 Markdown；默认控制在 ${answerLength}；先给结论，再列关键依据和影响判断；“关键依据”中的每条事实必须标注来源编号，如 [1]；不要提及 SQL、表名、MCP、向量、模型、接口、系统实现或检索过程。`,
+          '结构建议：**结论**、**关键依据**、**影响判断**。如果用户问题很简单，可以合并为更短的段落。',
           '',
-          'PG 向量召回材料：',
+          '参考材料：',
           sourceBlock,
         ].filter(Boolean).join('\n'),
       },
       ...conversation,
     ];
+  }
+
+  private directAnswerMaxTokens(messages: ChatRequest['messages']): number {
+    const question = this.lastUserMessage(messages);
+    return /详细|深入|展开|全面|完整|系统|长篇|多角度/.test(question) ? 1400 : 900;
   }
 
   private async recallPgSources(question: string): Promise<Record<string, unknown>[]> {
