@@ -30,6 +30,9 @@ interface ChatRequest {
 const require = createRequire(import.meta.url);
 const PG_SOURCE_TABLE = process.env.PGVECTOR_NEWS_TABLE || 'vector_materials_text_embedding_v4';
 const VECTOR_RECALL_TIMEOUT_MS = Math.max(3000, Number(process.env.DIRECT_QA_VECTOR_TIMEOUT_MS || 8000));
+const KEYWORD_RECALL_TIMEOUT_MS = Math.max(1500, Number(process.env.DIRECT_QA_KEYWORD_TIMEOUT_MS || 3500));
+const SOURCE_RECALL_CACHE_TTL_MS = Math.max(30_000, Number(process.env.DIRECT_QA_SOURCE_CACHE_TTL_MS || 600_000));
+const SOURCE_RECALL_CACHE_MAX = Math.max(10, Number(process.env.DIRECT_QA_SOURCE_CACHE_MAX || 200));
 
 @Injectable()
 export class ChatService {
@@ -39,6 +42,8 @@ export class ChatService {
   private directClientKey = '';
   private pgPool: PgPool | null = null;
   private readonly embeddingCache = new Map<string, number[]>();
+  private readonly sourceRecallCache = new Map<string, { expiresAt: number; sources: Record<string, unknown>[] }>();
+  private readonly pendingSourceRecalls = new Map<string, Promise<Record<string, unknown>[]>>();
 
   constructor(
     private readonly openClaw: OpenClawService,
@@ -192,14 +197,42 @@ export class ChatService {
   }
 
   private async recallPgSources(question: string): Promise<Record<string, unknown>[]> {
-    const vectorSources = await this.withTimeout(
-      this.searchPgVectorSources(question),
-      VECTOR_RECALL_TIMEOUT_MS,
-      'PG vector recall timed out',
-    );
-    if (vectorSources.length >= 6) return vectorSources;
-    const keywordSources = await this.searchPgKeywordSources(question);
-    return this.dedupeSources([...vectorSources, ...keywordSources]).slice(0, 8);
+    const cacheKey = this.sourceRecallCacheKey(question);
+    if (!cacheKey) return [];
+
+    const cached = this.sourceRecallCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) return cached.sources;
+
+    const pending = this.pendingSourceRecalls.get(cacheKey);
+    if (pending) return pending;
+
+    const recall = this.recallPgSourcesUncached(question)
+      .then((sources) => {
+        if (sources.length) this.rememberSourceRecall(cacheKey, sources);
+        return sources;
+      })
+      .finally(() => this.pendingSourceRecalls.delete(cacheKey));
+    this.pendingSourceRecalls.set(cacheKey, recall);
+    return recall;
+  }
+
+  private async recallPgSourcesUncached(question: string): Promise<Record<string, unknown>[]> {
+    const [vectorResult, keywordResult] = await Promise.allSettled([
+      this.withTimeout(
+        this.searchPgVectorSources(question),
+        VECTOR_RECALL_TIMEOUT_MS,
+        'PG vector recall timed out',
+      ),
+      this.withTimeout(
+        this.searchPgKeywordSources(question),
+        KEYWORD_RECALL_TIMEOUT_MS,
+        'PG keyword recall timed out',
+      ),
+    ]);
+
+    const vectorSources = vectorResult.status === 'fulfilled' ? vectorResult.value : [];
+    const keywordSources = keywordResult.status === 'fulfilled' ? keywordResult.value : [];
+    return this.mergeRecallSources(vectorSources, keywordSources).slice(0, 8);
   }
 
   private async searchPgVectorSources(question: string): Promise<Record<string, unknown>[]> {
@@ -339,6 +372,50 @@ export class ChatService {
       result.push(item);
     }
     return result;
+  }
+
+  private mergeRecallSources(
+    vectorSources: Record<string, unknown>[],
+    keywordSources: Record<string, unknown>[],
+  ): Record<string, unknown>[] {
+    const merged: Record<string, unknown>[] = [];
+    const seen = new Set<string>();
+    const add = (items: Record<string, unknown>[], limit: number) => {
+      for (const item of items) {
+        if (merged.length >= limit) break;
+        const key = String(item.url || item.title || item.summary || '');
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        merged.push(item);
+      }
+    };
+
+    add(vectorSources, 5);
+    add(keywordSources, 8);
+    add(vectorSources.slice(5), 12);
+    return merged.slice(0, 8);
+  }
+
+  private sourceRecallCacheKey(question: string): string {
+    const normalized = String(question || '')
+      .normalize('NFKC')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase()
+      .slice(0, 600);
+    return normalized ? `${DIRECT_QA_EMBEDDING_MODEL}:${DIRECT_QA_EMBEDDING_DIMENSIONS}:${PG_SOURCE_TABLE}:${normalized}` : '';
+  }
+
+  private rememberSourceRecall(cacheKey: string, sources: Record<string, unknown>[]): void {
+    this.sourceRecallCache.set(cacheKey, {
+      expiresAt: Date.now() + SOURCE_RECALL_CACHE_TTL_MS,
+      sources,
+    });
+    while (this.sourceRecallCache.size > SOURCE_RECALL_CACHE_MAX) {
+      const firstKey = this.sourceRecallCache.keys().next().value;
+      if (!firstKey) break;
+      this.sourceRecallCache.delete(firstKey);
+    }
   }
 
   private async getPgPool(): Promise<PgPool> {
