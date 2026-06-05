@@ -62,6 +62,7 @@ docker run -d \
   -e OPENCLAW_MODEL=openclaw/report-agent \
   -e OPENCLAW_QA_AGENT_ID=${OPENCLAW_QA_AGENT_ID:-qa-agent} \
   -e OPENCLAW_QA_MODEL=${OPENCLAW_QA_MODEL:-openclaw/qa-agent} \
+  -e OPENCLAW_QA_MODE=${OPENCLAW_QA_MODE:-direct_pg} \
   -e OPENCLAW_QA_TIMEOUT_MS=${OPENCLAW_QA_TIMEOUT_MS:-900000} \
   -e OPENCLAW_REMOTE_HOST= \
   -e REPORT_OUTPUT_DIR=/home/node/.openclaw/workspace/report-agent/reports \

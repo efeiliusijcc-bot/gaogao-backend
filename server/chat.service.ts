@@ -13,6 +13,7 @@ import {
 } from './config.js';
 import { OpenClawService } from './openclaw.service.js';
 import { QaSessionSourcesService } from './qa-session-sources.service.js';
+import { ResearchKeysService } from './research-keys.service.js';
 import type { ServerEvent } from './types.js';
 
 type PgPool = {
@@ -34,15 +35,15 @@ const VECTOR_RECALL_TIMEOUT_MS = Math.max(3000, Number(process.env.DIRECT_QA_VEC
 export class ChatService {
   private readonly streams = new Map<string, Subject<ServerEvent>>();
   private readonly history = new Map<string, ServerEvent[]>();
-  private readonly directClient = DIRECT_QA_API_KEY
-    ? new OpenAI({ apiKey: DIRECT_QA_API_KEY, baseURL: DIRECT_QA_BASE_URL })
-    : null;
+  private directClient: OpenAI | null = null;
+  private directClientKey = '';
   private pgPool: PgPool | null = null;
   private readonly embeddingCache = new Map<string, number[]>();
 
   constructor(
     private readonly openClaw: OpenClawService,
     private readonly qaSources: QaSessionSourcesService,
+    private readonly researchKeys: ResearchKeysService,
   ) {}
 
   async complete(body: ChatRequest) {
@@ -121,7 +122,7 @@ export class ChatService {
     onEvent: (event: ServerEvent) => void,
     sessionId?: string,
   ): Promise<string> {
-    if (!this.directClient) throw new Error('DIRECT_QA_API_KEY is not configured');
+    const client = await this.getDirectClient();
     const question = this.lastUserMessage(messages);
     onEvent({ type: 'stage', stage: 'retrieval_started', message: '正在执行 PG 向量召回' });
     const sources = await this.recallPgSources(question);
@@ -135,7 +136,7 @@ export class ChatService {
       message: sources.length ? `已向量召回 ${sources.length} 条 PG 信源，正在生成回答` : 'PG 向量召回未命中足够材料，正在生成回答',
     });
 
-    const stream = await this.directClient.chat.completions.create({
+    const stream = await client.chat.completions.create({
       model: DIRECT_QA_MODEL,
       messages: this.buildPgGroundedMessages(messages, sources),
       stream: true,
@@ -253,13 +254,13 @@ export class ChatService {
   }
 
   private async embedQuestion(question: string): Promise<number[]> {
-    if (!this.directClient) return [];
+    const client = await this.getDirectClient();
     const text = String(question || '').replace(/\s+/g, ' ').trim().slice(0, 600);
     if (!text) return [];
     const cacheKey = `${DIRECT_QA_EMBEDDING_MODEL}:${DIRECT_QA_EMBEDDING_DIMENSIONS}:${text}`;
     const cached = this.embeddingCache.get(cacheKey);
     if (cached) return cached;
-    const response = await this.directClient.embeddings.create({
+    const response = await client.embeddings.create({
       model: DIRECT_QA_EMBEDDING_MODEL,
       input: [text],
       ...(DIRECT_QA_EMBEDDING_DIMENSIONS ? { dimensions: DIRECT_QA_EMBEDDING_DIMENSIONS } : {}),
@@ -273,6 +274,16 @@ export class ChatService {
       }
     }
     return vector;
+  }
+
+  private async getDirectClient(): Promise<OpenAI> {
+    const apiKey = DIRECT_QA_API_KEY || await this.researchKeys.getEffectiveKey('openaiEmbeddingApiKey');
+    if (!apiKey) throw new Error('DIRECT_QA_API_KEY is not configured');
+    if (!this.directClient || this.directClientKey !== apiKey) {
+      this.directClient = new OpenAI({ apiKey, baseURL: DIRECT_QA_BASE_URL });
+      this.directClientKey = apiKey;
+    }
+    return this.directClient;
   }
 
   private normalizePgRow(row: Record<string, unknown>, terms: string[], method: 'pg_vector' | 'pg_keyword_supplement'): Record<string, unknown> {
