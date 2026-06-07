@@ -33,6 +33,8 @@ const VECTOR_RECALL_TIMEOUT_MS = Math.max(3000, Number(process.env.DIRECT_QA_VEC
 const KEYWORD_RECALL_TIMEOUT_MS = Math.max(1500, Number(process.env.DIRECT_QA_KEYWORD_TIMEOUT_MS || 3500));
 const SOURCE_RECALL_CACHE_TTL_MS = Math.max(30_000, Number(process.env.DIRECT_QA_SOURCE_CACHE_TTL_MS || 600_000));
 const SOURCE_RECALL_CACHE_MAX = Math.max(10, Number(process.env.DIRECT_QA_SOURCE_CACHE_MAX || 200));
+const VECTOR_CANDIDATE_LIMIT = Math.max(32, Math.min(120, Number(process.env.DIRECT_QA_VECTOR_CANDIDATE_LIMIT || 72)));
+const KEYWORD_CANDIDATE_LIMIT = Math.max(40, Math.min(160, Number(process.env.DIRECT_QA_KEYWORD_CANDIDATE_LIMIT || 80)));
 
 @Injectable()
 export class ChatService {
@@ -129,8 +131,9 @@ export class ChatService {
   ): Promise<string> {
     const client = await this.getDirectClient();
     const question = this.lastUserMessage(messages);
+    const topic = this.buildQuestionEmbeddingText(messages);
     onEvent({ type: 'stage', stage: 'retrieval_started', message: '正在执行 PG 向量召回' });
-    const sources = await this.recallPgSources(question);
+    const sources = await this.recallPgSources(question, topic);
     if (sources.length) {
       onEvent({ type: 'sources', sources });
       if (sessionId) await this.qaSources.upsertSources(sessionId, { sources, merge: true });
@@ -204,8 +207,24 @@ export class ChatService {
     return /详细|深入|展开|全面|完整|系统|长篇|多角度/.test(question) ? 1400 : 900;
   }
 
-  private async recallPgSources(question: string): Promise<Record<string, unknown>[]> {
-    const cacheKey = this.sourceRecallCacheKey(question);
+  private buildQuestionEmbeddingText(messages: ChatRequest['messages']): string {
+    const question = this.lastUserMessage(messages);
+    const recent = messages
+      .filter((item) => item.role === 'user' || item.role === 'assistant')
+      .slice(-5)
+      .map((item) => `${item.role === 'user' ? '用户' : '回答'}: ${String(item.content || '').replace(/\s+/g, ' ').trim().slice(0, 220)}`)
+      .filter((line) => line.length > 8)
+      .join('\n');
+    const terms = this.extractFocusedPgSearchTerms(`${recent}\n${question}`).slice(0, 18).join(' ');
+    return [
+      `主题：${question}`,
+      terms ? `关键词：${terms}` : '',
+      recent ? `近期上下文：\n${recent}` : '',
+    ].filter(Boolean).join('\n').slice(0, 900);
+  }
+
+  private async recallPgSources(question: string, embeddingText = question): Promise<Record<string, unknown>[]> {
+    const cacheKey = this.sourceRecallCacheKey(question, embeddingText);
     if (!cacheKey) return [];
 
     const cached = this.sourceRecallCache.get(cacheKey);
@@ -214,7 +233,7 @@ export class ChatService {
     const pending = this.pendingSourceRecalls.get(cacheKey);
     if (pending) return pending;
 
-    const recall = this.recallPgSourcesUncached(question)
+    const recall = this.recallPgSourcesUncached(question, embeddingText)
       .then((sources) => {
         if (sources.length) this.rememberSourceRecall(cacheKey, sources);
         return sources;
@@ -224,10 +243,10 @@ export class ChatService {
     return recall;
   }
 
-  private async recallPgSourcesUncached(question: string): Promise<Record<string, unknown>[]> {
+  private async recallPgSourcesUncached(question: string, embeddingText: string): Promise<Record<string, unknown>[]> {
     const [vectorResult, keywordResult] = await Promise.allSettled([
       this.withTimeout(
-        this.searchPgVectorSources(question),
+        this.searchPgVectorSources(question, embeddingText),
         VECTOR_RECALL_TIMEOUT_MS,
         'PG vector recall timed out',
       ),
@@ -240,48 +259,76 @@ export class ChatService {
 
     const vectorSources = vectorResult.status === 'fulfilled' ? vectorResult.value : [];
     const keywordSources = keywordResult.status === 'fulfilled' ? keywordResult.value : [];
-    return this.mergeRecallSources(vectorSources, keywordSources).slice(0, 8);
+    return this.mergeRecallSources(vectorSources, keywordSources);
   }
 
-  private async searchPgVectorSources(question: string): Promise<Record<string, unknown>[]> {
-    const embedding = await this.embedQuestion(question);
+  private async searchPgVectorSources(question: string, embeddingText: string): Promise<Record<string, unknown>[]> {
+    const embedding = await this.embedQuestion(embeddingText);
     if (!embedding.length) return [];
     const vector = this.toVectorLiteral(embedding);
     const pool = await this.getPgPool();
-    const rows = await pool.query(
+    const terms = this.extractFocusedPgSearchTerms(question);
+    const vectorQueries: Array<Promise<{ rows: Array<Record<string, unknown>> }>> = [];
+    const topicTerms = terms.slice(0, 8);
+    if (topicTerms.length) {
+      const params: unknown[] = [vector];
+      const clauses: string[] = [];
+      for (const term of topicTerms) {
+        params.push(`%${term}%`);
+        const placeholder = `$${params.length}`;
+        clauses.push(`(ch_title ILIKE ${placeholder} OR entitle ILIKE ${placeholder} OR summary ILIKE ${placeholder} OR content ILIKE ${placeholder} OR embedding_text ILIKE ${placeholder})`);
+      }
+      vectorQueries.push(pool.query(
+        `SELECT ch_title, entitle, data_source_url, website_name, publish_time, summary, content_excerpt, content,
+                1 - (embedding_vector <=> $1::vector) AS similarity
+           FROM ${this.qi(PG_SOURCE_TABLE)}
+          WHERE embedding_vector IS NOT NULL
+            AND (${clauses.join(' OR ')})
+          ORDER BY embedding_vector <=> $1::vector
+          LIMIT ${Math.min(48, VECTOR_CANDIDATE_LIMIT)}`,
+        params,
+      ));
+    }
+    vectorQueries.push(pool.query(
       `SELECT ch_title, entitle, data_source_url, website_name, publish_time, summary, content_excerpt, content,
               1 - (embedding_vector <=> $1::vector) AS similarity
          FROM ${this.qi(PG_SOURCE_TABLE)}
         WHERE embedding_vector IS NOT NULL
         ORDER BY embedding_vector <=> $1::vector
-        LIMIT 24`,
+        LIMIT ${VECTOR_CANDIDATE_LIMIT}`,
       [vector],
-    );
-    return rows.rows
-      .map((row) => this.normalizePgRow(row, [], 'pg_vector'))
+    ));
+    const settled = await Promise.allSettled(vectorQueries);
+    const candidateRows = settled.flatMap((result) => result.status === 'fulfilled' ? result.value.rows : []);
+    const scored = candidateRows
+      .map((row) => this.normalizePgRow(row, terms, 'pg_vector'))
       .filter((item) => item.title || item.summary || item.url)
-      .sort((a, b) => Number(b.relevance || 0) - Number(a.relevance || 0))
-      .slice(0, 8);
+      .sort((a, b) => Number(b.relevance || 0) - Number(a.relevance || 0));
+    return this.dedupeSources(scored);
   }
 
   private async searchPgKeywordSources(question: string): Promise<Record<string, unknown>[]> {
-    const terms = this.extractPgSearchTerms(question);
+    const terms = this.extractFocusedPgSearchTerms(question);
     if (!terms.length) return [];
     const pool = await this.getPgPool();
     const clauses: string[] = [];
     const params: unknown[] = [];
-    for (const term of terms.slice(0, 10)) {
+    for (const term of terms.slice(0, 12)) {
       params.push(`%${term}%`);
       const placeholder = `$${params.length}`;
       clauses.push(`(ch_title ILIKE ${placeholder} OR entitle ILIKE ${placeholder} OR summary ILIKE ${placeholder} OR content ILIKE ${placeholder} OR embedding_text ILIKE ${placeholder})`);
     }
+    const scoreExpression = clauses.map((clause) => `(CASE WHEN ${clause} THEN 1 ELSE 0 END)`).join(' + ');
+    const minimumHits = terms.length >= 4 ? 2 : 1;
     const rows = await this.withTimeout(
       pool.query(
-        `SELECT ch_title, entitle, data_source_url, website_name, publish_time, summary, content_excerpt, content
+        `SELECT ch_title, entitle, data_source_url, website_name, publish_time, summary, content_excerpt, content,
+                (${scoreExpression}) AS keyword_score
            FROM ${this.qi(PG_SOURCE_TABLE)}
           WHERE (${clauses.join(' OR ')})
-          ORDER BY publish_time DESC NULLS LAST, indexed_at DESC NULLS LAST
-          LIMIT 40`,
+            AND (${scoreExpression}) >= ${minimumHits}
+          ORDER BY keyword_score DESC, publish_time DESC NULLS LAST, indexed_at DESC NULLS LAST
+          LIMIT ${KEYWORD_CANDIDATE_LIMIT}`,
         params,
       ),
       4500,
@@ -291,12 +338,12 @@ export class ChatService {
       .map((row) => this.normalizePgRow(row, terms, 'pg_keyword_supplement'))
       .filter((item) => item.title || item.summary || item.url)
       .sort((a, b) => Number(b.relevance || 0) - Number(a.relevance || 0));
-    return this.dedupeSources(scored).slice(0, 8);
+    return this.dedupeSources(scored);
   }
 
   private async embedQuestion(question: string): Promise<number[]> {
     const client = await this.getDirectClient();
-    const text = String(question || '').replace(/\s+/g, ' ').trim().slice(0, 600);
+    const text = String(question || '').replace(/\s+/g, ' ').trim().slice(0, 900);
     if (!text) return [];
     const cacheKey = `${DIRECT_QA_EMBEDDING_MODEL}:${DIRECT_QA_EMBEDDING_DIMENSIONS}:${text}`;
     const cached = this.embeddingCache.get(cacheKey);
@@ -335,7 +382,9 @@ export class ChatService {
     const url = this.clean(String(row.data_source_url || ''), 500);
     const haystack = `${title} ${summary} ${contentExcerpt} ${websiteName}`.toLowerCase();
     const hits = terms.filter((term) => haystack.includes(term.toLowerCase())).length;
+    const titleHits = terms.filter((term) => title.toLowerCase().includes(term.toLowerCase())).length;
     const similarity = Number(row.similarity || 0);
+    const vectorRelevance = similarity + Math.min(hits, 5) * 0.08 + Math.min(titleHits, 3) * 0.05 - (terms.length >= 3 && hits === 0 ? 0.18 : 0);
     return {
       id: `${method}-${Buffer.from(url || title || summary).toString('base64url').slice(0, 18)}`,
       title,
@@ -344,13 +393,48 @@ export class ChatService {
       contentExcerpt,
       websiteName,
       publishTime: this.dateString(row.publish_time),
-      relevance: method === 'pg_vector' ? Number(similarity.toFixed(4)) : hits,
+      relevance: method === 'pg_vector' ? Number(vectorRelevance.toFixed(4)) : hits + titleHits * 2,
       similarity: method === 'pg_vector' ? Number(similarity.toFixed(4)) : undefined,
       sourceType: 'PG信源库',
       sourceOrigin: 'database_recall',
       method,
       status: 'hit',
     };
+  }
+
+  private extractFocusedPgSearchTerms(question: string): string[] {
+    const text = String(question || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+    const terms = new Set<string>();
+    const stopwords = /^(请|简要|说明|分析|影响|什么|如何|怎么|为什么|是否|有关|关于|近期|最近|今天|一个|一下|以及|还有|这个|那个|问题|回答|用户)$/;
+    const addTerm = (value: string) => {
+      const item = value.replace(/^[的了和与及对在从把被将是为就都而或、，。；：！？\s]+|[的了和与及对在从把被将是为就都而或、，。；：！？\s]+$/g, '').trim();
+      if (item.length < 2 || item.length > 24 || stopwords.test(item)) return;
+      terms.add(item);
+    };
+
+    const parts = text
+      .split(/[^\p{Script=Han}a-zA-Z0-9]+|以及|还有|关于|有关|请|简要|说明|分析|影响|什么|如何|怎么|为什么|是否|对|和|与|及|的/gu)
+      .map((part) => part.trim())
+      .filter(Boolean);
+    for (const part of parts) addTerm(part);
+
+    const compact = text.replace(/\s+/g, '');
+    for (const match of compact.matchAll(/[\p{Script=Han}A-Za-z0-9]{2,12}(?:调查|服务费|造船业|航运|港口|关税|制裁|法案|政策|风险|产业链|供应链)/gu)) {
+      addTerm(match[0]);
+    }
+    for (const match of text.matchAll(/[A-Za-z0-9][A-Za-z0-9-]{1,}/g)) {
+      addTerm(match[0]);
+    }
+
+    for (const part of parts) {
+      if (!/[\p{Script=Han}]/u.test(part) || part.length <= 4) continue;
+      for (let size = Math.min(6, part.length); size >= 2 && terms.size < 32; size -= 1) {
+        for (let index = 0; index <= part.length - size && terms.size < 32; index += 1) {
+          addTerm(part.slice(index, index + size));
+        }
+      }
+    }
+    return Array.from(terms).slice(0, 32);
   }
 
   private extractPgSearchTerms(question: string): string[] {
@@ -398,19 +482,20 @@ export class ChatService {
       }
     };
 
-    add(vectorSources, 5);
-    add(keywordSources, 8);
-    add(vectorSources.slice(5), 12);
-    return merged.slice(0, 8);
+    const keywordLead = Math.min(4, keywordSources.length);
+    add(keywordSources, keywordLead);
+    add(vectorSources, keywordLead + vectorSources.length);
+    add(keywordSources.slice(keywordLead), keywordLead + vectorSources.length + keywordSources.length);
+    return merged;
   }
 
-  private sourceRecallCacheKey(question: string): string {
-    const normalized = String(question || '')
+  private sourceRecallCacheKey(question: string, embeddingText = question): string {
+    const normalized = String(embeddingText || question || '')
       .normalize('NFKC')
       .replace(/\s+/g, ' ')
       .trim()
       .toLowerCase()
-      .slice(0, 600);
+      .slice(0, 900);
     return normalized ? `${DIRECT_QA_EMBEDDING_MODEL}:${DIRECT_QA_EMBEDDING_DIMENSIONS}:${PG_SOURCE_TABLE}:${normalized}` : '';
   }
 
@@ -433,11 +518,11 @@ export class ChatService {
     const { Pool } = require('pg') as { Pool: new (config: Record<string, unknown>) => PgPool };
     this.pgPool = new Pool({
       connectionString,
-      max: 2,
+      max: 4,
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 2500,
-      query_timeout: 4500,
-      statement_timeout: 4500,
+      query_timeout: 6500,
+      statement_timeout: 6500,
     });
     return this.pgPool;
   }
@@ -482,7 +567,8 @@ export class ChatService {
     if (!sessionId) return null;
     let sources = this.openClaw.extractQaSessionSources(sessionId);
     if (!sources.length) {
-      sources = await this.recallPgSources(this.lastUserMessage(messages));
+      const question = this.lastUserMessage(messages);
+      sources = await this.recallPgSources(question, this.buildQuestionEmbeddingText(messages));
     }
     if (!sources.length) return null;
     await this.qaSources.upsertSources(sessionId, { sources, merge: true });
