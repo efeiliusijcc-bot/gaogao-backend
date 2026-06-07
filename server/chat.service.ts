@@ -458,12 +458,50 @@ export class ChatService {
     const seen = new Set<string>();
     const result: Record<string, unknown>[] = [];
     for (const item of items) {
-      const key = String(item.url || item.title || item.summary || '');
-      if (!key || seen.has(key)) continue;
-      seen.add(key);
+      const keys = this.sourceDedupeKeys(item);
+      if (!keys.length || keys.some((key) => seen.has(key))) continue;
+      for (const key of keys) seen.add(key);
       result.push(item);
     }
     return result;
+  }
+
+  private sourceDedupeKeys(item: Record<string, unknown>): string[] {
+    const keys = new Set<string>();
+    const url = this.normalizeSourceUrl(String(item.url || ''));
+    const title = this.normalizeSourceText(String(item.title || ''));
+    const websiteName = this.normalizeSourceText(String(item.websiteName || ''));
+    const summary = this.normalizeSourceText(String(item.summary || item.contentExcerpt || ''));
+    if (url) keys.add(`url:${url}`);
+    if (title) keys.add(`title:${title}`);
+    if (title && websiteName) keys.add(`site-title:${websiteName}:${title}`);
+    if (summary.length >= 40) keys.add(`summary:${summary.slice(0, 120)}`);
+    return Array.from(keys);
+  }
+
+  private normalizeSourceUrl(value: string): string {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    try {
+      const parsed = new URL(raw);
+      parsed.hash = '';
+      for (const key of Array.from(parsed.searchParams.keys())) {
+        if (/^(utm_|spm|fbclid|gclid|yclid|from|source|ref)/i.test(key)) parsed.searchParams.delete(key);
+      }
+      parsed.hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+      return parsed.toString().replace(/\/$/, '');
+    } catch {
+      return raw.toLowerCase().replace(/[?#].*$/, '').replace(/\/$/, '');
+    }
+  }
+
+  private normalizeSourceText(value: string): string {
+    return String(value || '')
+      .normalize('NFKC')
+      .toLowerCase()
+      .replace(/[\s\u3000]+/g, '')
+      .replace(/[|｜:：,，.。;；!！?？"'“”‘’《》〈〉（）()[\]{}【】\-—_·]/g, '')
+      .trim();
   }
 
   private mergeRecallSources(
@@ -475,9 +513,9 @@ export class ChatService {
     const add = (items: Record<string, unknown>[], limit: number) => {
       for (const item of items) {
         if (merged.length >= limit) break;
-        const key = String(item.url || item.title || item.summary || '');
-        if (!key || seen.has(key)) continue;
-        seen.add(key);
+        const keys = this.sourceDedupeKeys(item);
+        if (!keys.length || keys.some((key) => seen.has(key))) continue;
+        for (const key of keys) seen.add(key);
         merged.push(item);
       }
     };
