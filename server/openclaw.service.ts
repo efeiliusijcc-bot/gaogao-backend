@@ -11,6 +11,7 @@ import {
   OPENCLAW_MODEL,
   OPENCLAW_QA_AGENT_ID,
   OPENCLAW_QA_MODEL,
+  OPENCLAW_QA_MODE,
   OPENCLAW_QA_TIMEOUT_MS,
   OPENCLAW_STATE_DIR,
   REPORT_TIMEOUT_MS,
@@ -341,6 +342,26 @@ export class OpenClawService {
     onEvent: (event: ServerEvent) => void,
     sessionId?: string,
   ): Promise<string> {
+    if (OPENCLAW_QA_MODE === 'direct') {
+      try {
+        return await this.streamQaViaHttp(messages, onEvent);
+      } catch (error) {
+        console.warn(
+          `Direct QA model ${OPENCLAW_QA_MODEL} failed; falling back to OpenClaw qa-agent:`,
+          error instanceof Error ? error.message : String(error),
+        );
+        return this.streamQaViaGateway(messages, onEvent, sessionId, false);
+      }
+    }
+    return this.streamQaViaGateway(messages, onEvent, sessionId, true);
+  }
+
+  private async streamQaViaGateway(
+    messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+    onEvent: (event: ServerEvent) => void,
+    sessionId?: string,
+    allowHttpFallback = true,
+  ): Promise<string> {
     let keepAliveTimer: NodeJS.Timeout | undefined;
     const sessionKey = this.buildQaGatewaySessionKey(sessionId);
     const startedAt = Date.now();
@@ -387,6 +408,7 @@ export class OpenClawService {
     } catch (error) {
       if (keepAliveTimer) clearInterval(keepAliveTimer);
       if (streamedText.trim()) return streamedText.trim();
+      if (!allowHttpFallback) throw error;
       console.warn(
         `OpenClaw qa-agent Gateway call failed; falling back to HTTP model ${OPENCLAW_QA_MODEL}:`,
         error instanceof Error ? error.message : String(error),
@@ -399,6 +421,7 @@ export class OpenClawService {
     messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
     onEvent: (event: ServerEvent) => void,
   ): Promise<string> {
+    onEvent({ type: 'stage', stage: 'direct_model_started', message: '正在连接热点感知模型' });
     const stream = await this.client.chat.completions.create({
       model: OPENCLAW_QA_MODEL,
       messages,
@@ -407,6 +430,7 @@ export class OpenClawService {
 
     let text = '';
     const seenTools = new Set<string>();
+    let emittedSynthesisStage = false;
 
     for await (const chunk of stream) {
       for (const choice of chunk.choices || []) {
@@ -414,6 +438,10 @@ export class OpenClawService {
         const content = typeof delta.content === 'string' ? delta.content : '';
 
         if (content) {
+          if (!emittedSynthesisStage) {
+            emittedSynthesisStage = true;
+            onEvent({ type: 'stage', stage: 'synthesis_started', message: '正在生成回答' });
+          }
           text += content;
           onEvent({ type: 'text_delta', content });
           onEvent({ type: 'token', content });
@@ -944,6 +972,8 @@ export class OpenClawService {
       '17. K报正文开头必须按标准样式把导语和摘要合并为“一、基本情况”之前的一整段自然段正文；不得生成“导语”“摘要”“导语/摘要”“摘要导语”等任何小标题，也不得拆成两个独立模块。',
       '18. K report format lock: use this exact structure, without relying on any historical file path: centered bold title; two separate metadata lines **编号：**K-YYYY-MMDD-NNN and **签发日期：**YYYY年M月D日; one untitled preface paragraph; ## **一、基本情况** with exactly four fixed subheadings ### **（一）主要内容**, ### **（二）各方态度**, ### **（三）相关情况**, ### **（四）其他背景**; ## **二、涉我风险** has no subheadings and uses bold Markdown leads **一是...。**, **二是...。**, **三是...。**, **四是...。**; ## **三、对策建议** has no subheadings and uses bold Markdown leads **一是...。**, **二是...。**, **三是...。**; ## **四、参考资料** is followed by **来源可信度评估：** paragraphs and **信息缺口：** numbered list.',
       '19. selectedDirections only guide material coverage; never render selectedDirections labels such as 事件经过, 政策依据, 涉我安全利益, 风险传导路径, 风险等级判断, 立即措施, 中期措施, 预案与风险提示 as headings, subheadings, or fixed paragraph leads.',
+      '19a. Planning enforcement: if known_context.selectedModules is present, build an internal outline map before writing. Each selected module sectionTitle must be mapped into the closest fixed K/HB report section, and every selectedDirections item must be substantively covered in that mapped section with concrete facts, analysis, risks, or countermeasures.',
+      '19b. Planning compliance check: before saving final Markdown, verify that the final report body contains material for all selectedModules and selectedDirections. If a selected direction has insufficient evidence, keep the fixed report structure but explicitly cover it as an information gap or monitoring point in the relevant section instead of silently omitting it.',
       `20. Internal reference artifact: after final Markdown is complete, create ${OPENCLAW_CONTAINER_REPORT_DIR}/${jobId}/references/report_references.json. It must contain every citation number used in the final report body, including citations that came from non-structured public research evidence and citations that do not match database/vector sources.`,
       '21. The internal reference artifact JSON schema is: {"jobId":"...","updatedAt":"ISO time","sourceCount":N,"references":[{"citationNo":1,"title":"","sourceName":"","url":"","publishedAt":"","summary":"","excerpt":"","rawReferenceText":"[1] ...","sourceType":"report_reference","relevanceScore":100,"status":"referenced","method":"final_report_reference_index","matchStatus":"matched|raw_only"}]}.',
       '22. Keep report_references.json internal only: do not mention its path, JSON schema, SQL, MCP, OpenClaw, Agent, database tables, or implementation details in the final user-visible report. The final Markdown reference section remains normal Chinese report text.',

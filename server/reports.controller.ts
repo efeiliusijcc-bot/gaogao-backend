@@ -32,18 +32,7 @@ export class ReportsController {
     if (!job) {
       throw new HttpException({ error: 'Job not found' }, HttpStatus.NOT_FOUND);
     }
-    return {
-      jobId: job.jobId,
-      skill: job.skill,
-      payload: job.payload,
-      status: job.status,
-      stage: job.stage,
-      errorMessage: job.errorMessage,
-      resultPath: job.resultPath,
-      progressState: job.progressState,
-      createdAt: job.createdAt,
-      updatedAt: job.updatedAt,
-    };
+    return this.reports.serializeJob(job);
   }
 
   @Get(':jobId/progress')

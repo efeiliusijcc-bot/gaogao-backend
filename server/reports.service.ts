@@ -218,26 +218,26 @@ export class ReportsService {
   getEventLog(jobId: string): { jobId: string; items: EventLogEntry[] } | undefined {
     const job = this.jobs.get(jobId);
     if (!job) return undefined;
-    return { jobId, items: job.eventLog ?? [] };
+    return { jobId, items: (job.eventLog ?? []).map((item) => this.sanitizeEventLogEntry(item)) };
   }
 
   async getProgressState(jobId: string): Promise<ReportProgressState | undefined> {
     const job = this.jobs.get(jobId);
     if (!job) return undefined;
     await this.refreshProgressState(job);
-    return job.progressState;
+    return this.sanitizeProgressState(job.progressState);
   }
 
-  private serializeJob(job: JobRecord) {
+  serializeJob(job: JobRecord) {
     return {
       jobId: job.jobId,
       skill: job.skill,
       payload: job.payload,
       status: job.status,
       stage: job.stage,
-      errorMessage: job.errorMessage,
+      errorMessage: this.sanitizeUserVisibleText(job.errorMessage || '', 300) || undefined,
       resultPath: job.resultPath,
-      progressState: job.progressState,
+      progressState: this.sanitizeProgressState(job.progressState),
       createdAt: job.createdAt,
       updatedAt: job.updatedAt,
     };
@@ -837,11 +837,11 @@ export class ReportsService {
       try {
         result = await this.openClaw.runReportViaGateway(runInput);
       } catch (gatewayError) {
-        const message = gatewayError instanceof Error ? gatewayError.message : String(gatewayError);
+        const message = this.sanitizeUserVisibleText(gatewayError instanceof Error ? gatewayError.message : String(gatewayError), 300);
         this.pushEvent(job, {
           type: 'stage',
           stage: 'gateway_fallback',
-          message: `OpenClaw Gateway event stream unavailable; falling back to non-streaming generation. ${message}`,
+          message: `任务通道暂不可用，已切换为普通生成模式。${message}`,
         });
         recoveredReport = await this.resolveOpenClawReportFile('', startedAtMs);
         if (recoveredReport) {
@@ -917,7 +917,7 @@ export class ReportsService {
         return;
       }
 
-      const message = error instanceof Error ? error.message : String(error);
+      const message = this.sanitizeUserVisibleText(error instanceof Error ? error.message : String(error), 300);
       const recovered = await this.recoverJobFromExistingReport(job, 'failure_handler');
       if (recovered) {
         this.pushEvent(job, { type: 'done', jobId: job.jobId });
@@ -937,20 +937,21 @@ export class ReportsService {
   }
 
   private pushEvent(job: JobRecord, event: ServerEvent) {
-    if (event.type === 'progress_state') {
-      this.emitProgressState(job, event.progressState);
+    const safeEvent = this.sanitizeServerEvent(event);
+    if (safeEvent.type === 'progress_state') {
+      this.emitProgressState(job, safeEvent.progressState);
       return;
     }
-    job.events.push(event);
-    const logEntry = this.toEventLogEntry(job, event);
+    job.events.push(safeEvent);
+    const logEntry = this.toEventLogEntry(job, safeEvent);
     if (logEntry) {
       job.eventLog.push(logEntry);
       if (job.eventLog.length > 500) job.eventLog = job.eventLog.slice(-500);
     }
-    if (event.type === 'stage') {
-      job.stage = event.stage;
+    if (safeEvent.type === 'stage') {
+      job.stage = safeEvent.stage;
     }
-    this.streams.get(job.jobId)?.next(event);
+    this.streams.get(job.jobId)?.next(safeEvent);
     void this.writeJobState(job);
     void this.refreshProgressState(job, true);
   }
@@ -972,11 +973,11 @@ export class ReportsService {
       };
     }
 
-    if (event.type === 'tool_start' || event.type === 'tool_end' || event.type === 'tool_error') {
+    if (event.type === 'tool_start' || event.type === 'tool_delta' || event.type === 'tool_end' || event.type === 'tool_error') {
       const raw = event.raw && typeof event.raw === 'object' ? (event.raw as Record<string, unknown>) : {};
       const status =
         this.firstLogString(raw, ['status']) ||
-        (event.type === 'tool_start' ? 'started' : event.type === 'tool_end' ? 'completed' : 'failed');
+        (event.type === 'tool_start' ? 'started' : event.type === 'tool_end' ? 'completed' : event.type === 'tool_error' ? 'failed' : 'running');
       const label = this.sanitizeLogText(this.firstLogString(raw, ['label']) || event.name || 'Tool', 80);
       const summary = this.sanitizeLogText(
         this.firstLogString(raw, ['summary']) ||
@@ -987,6 +988,8 @@ export class ReportsService {
       const phase = this.sanitizeLogText(this.firstLogString(raw, ['phase']), 80);
       const actor = this.sanitizeLogText(this.firstLogString(raw, ['actor']), 80);
       const detail = this.sanitizeLogText(this.firstLogString(raw, ['detail']), 220);
+      const toolName = this.sanitizeLogText(this.extractToolNameForEvent(event, raw), 120);
+      const toolEngine = this.sanitizeLogText(this.inferToolEngine(toolName || label || command), 60);
       return {
         id: `${baseId}:${event.id ?? job.eventLog.length + 1}`,
         time: now,
@@ -998,6 +1001,8 @@ export class ReportsService {
         ...(phase ? { phase } : {}),
         ...(actor ? { actor } : {}),
         ...(detail ? { detail } : {}),
+        ...(toolName ? { toolName, toolDisplayName: this.formatToolDisplayName(toolName), toolId: event.id } : {}),
+        ...(toolEngine ? { toolEngine } : {}),
       };
     }
 
@@ -1036,6 +1041,45 @@ export class ReportsService {
       if (typeof candidate === 'string' && candidate.trim()) return candidate;
     }
     return '';
+  }
+
+  private extractToolNameForEvent(event: ServerEvent, raw: Record<string, unknown>): string {
+    const direct = 'name' in event && typeof event.name === 'string' ? event.name.trim() : '';
+    if (direct) return direct;
+    const rawDirect = this.firstLogString(raw, ['toolName', 'tool_name', 'name', 'tool', 'server', 'mcpServer', 'mcp_server']);
+    if (rawDirect) return rawDirect;
+    const rawFunction = raw.function && typeof raw.function === 'object' ? (raw.function as Record<string, unknown>) : null;
+    const functionName = this.firstString(rawFunction, ['name']);
+    if (functionName) return functionName;
+    const command = this.firstLogString(raw, ['command']);
+    if (/pg-sources__query/i.test(command)) return 'pg-sources__query';
+    if (/mysql-test__mysql_query/i.test(command)) return 'mysql-test__mysql_query';
+    if (/harness_cli\.py\s+plan/i.test(command)) return 'harness_cli.py plan';
+    if (/harness_cli\.py\s+run/i.test(command)) return 'harness_cli.py run';
+    if (/research_cli\.py/i.test(command)) return 'research_cli.py';
+    if (/firecrawl/i.test(command)) return 'firecrawl';
+    if (/tavily/i.test(command)) return 'tavily';
+    if (/\bexa\b/i.test(command)) return 'exa';
+    return '';
+  }
+
+  private inferToolEngine(value: string): string {
+    const lower = String(value || '').toLowerCase();
+    if (!lower) return '';
+    if (lower.includes('pg-sources') || lower.includes('pg_vector')) return 'pg_vector';
+    if (lower.includes('mysql')) return 'mysql';
+    if (lower.includes('firecrawl')) return 'firecrawl';
+    if (lower.includes('tavily_extract')) return 'tavily_extract';
+    if (lower.includes('tavily')) return 'tavily';
+    if (/\bexa\b/.test(lower)) return 'exa';
+    if (lower.includes('harness_cli')) return 'harness';
+    if (lower.includes('research_cli')) return 'research';
+    if (lower.includes('sessions_')) return 'session';
+    return '';
+  }
+
+  private formatToolDisplayName(toolName: string): string {
+    return this.sanitizeLogText(String(toolName || '').replace(/\s+/g, ' ').trim(), 120);
   }
 
   private firstString(data: Record<string, unknown> | null, keys: string[]): string {
@@ -1219,6 +1263,99 @@ export class ReportsService {
     return sanitized;
   }
 
+  private sanitizeServerEvent(event: ServerEvent): ServerEvent {
+    if (event.type === 'stage') {
+      return { ...event, message: this.sanitizeUserVisibleText(event.message, 500) };
+    }
+    if (event.type === 'status') {
+      return { ...event, message: event.message ? this.sanitizeUserVisibleText(event.message, 500) : event.message };
+    }
+    if (event.type === 'tool_error') {
+      return { ...event, message: this.sanitizeUserVisibleText(event.message, 500), raw: this.sanitizeEventRaw(event.raw) };
+    }
+    if (event.type === 'tool_start' || event.type === 'tool_delta' || event.type === 'tool_end') {
+      return { ...event, raw: this.sanitizeEventRaw(event.raw) };
+    }
+    if (event.type === 'approval_required') {
+      return { ...event, message: this.sanitizeUserVisibleText(event.message, 500) };
+    }
+    if (event.type === 'error') {
+      return { ...event, message: this.sanitizeUserVisibleText(event.message, 500) };
+    }
+    if (event.type === 'progress_state') {
+      return { ...event, progressState: this.sanitizeProgressState(event.progressState) ?? event.progressState };
+    }
+    return event;
+  }
+
+  private sanitizeEventRaw(raw: unknown): unknown {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw;
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+      result[key] = typeof value === 'string' ? this.sanitizeUserVisibleText(value, 800) : value;
+    }
+    return result;
+  }
+
+  private sanitizeProgressState(state: ReportProgressState | undefined): ReportProgressState | undefined {
+    if (!state) return undefined;
+    return {
+      ...state,
+      stages: state.stages.map((stage) => ({
+        ...stage,
+        evidence: stage.evidence.map((item) => ({
+          ...item,
+          message: this.sanitizeUserVisibleText(item.message, 500),
+        })),
+      })),
+    };
+  }
+
+  private sanitizeEventLogEntry(item: EventLogEntry): EventLogEntry {
+    return {
+      ...item,
+      label: this.sanitizeUserVisibleText(item.label, 120),
+      status: this.sanitizeUserVisibleText(item.status, 120),
+      summary: this.sanitizeUserVisibleText(item.summary, 500),
+      command: item.command ? this.sanitizeCommandForEventLog(item.command) : item.command,
+      phase: item.phase ? this.sanitizeUserVisibleText(item.phase, 120) : item.phase,
+      actor: item.actor ? this.sanitizeUserVisibleText(item.actor, 120) : item.actor,
+      detail: item.detail ? this.sanitizeUserVisibleText(item.detail, 500) : item.detail,
+      toolName: item.toolName ? this.sanitizeUserVisibleText(item.toolName, 120) : item.toolName,
+      toolDisplayName: item.toolDisplayName ? this.sanitizeUserVisibleText(item.toolDisplayName, 120) : item.toolDisplayName,
+      toolId: item.toolId ? this.sanitizeUserVisibleText(item.toolId, 120) : item.toolId,
+      toolEngine: item.toolEngine ? this.sanitizeUserVisibleText(item.toolEngine, 80) : item.toolEngine,
+    };
+  }
+
+  private sanitizeUserVisibleText(value: string, maxLength: number): string {
+    const text = this.sanitizeLogText(value, Math.max(maxLength * 4, 1000));
+    const lower = text.toLowerCase();
+    if (/content_filter|considered high risk|safety policy|安全策略|高风险/.test(lower)) {
+      return '本次主题触发模型安全策略，生成内容被拦截，未形成有效报告。请调整表述或降低敏感措辞后重试。';
+    }
+    const normalized = text
+      .replace(/OpenClaw\s+Gateway/gi, '任务通道')
+      .replace(/OpenClaw\s+report-agent/gi, '编报智能体')
+      .replace(/OpenClaw\s+qa-agent/gi, '问答智能体')
+      .replace(/OpenClaw/gi, '智能体服务')
+      .replace(/(?:\/home\/node\/\.openclaw\/workspace\/|\/usr\/docker\/openclaw\/workspace\/)/gi, '.../')
+      .replace(/\breport-agent\b/gi, '编报智能体')
+      .replace(/\bqa-agent\b/gi, '问答智能体')
+      .replace(/\bGateway\b/g, '任务通道')
+      .replace(/returned too little report content\.?/gi, '生成内容不足，未达到编报成稿要求。')
+      .replace(/returned a REPORT_FILE pointer, but no valid Markdown report file was found\.?/gi, '返回了报告文件指针，但未找到有效 Markdown 报告文件。')
+      .replace(/returned empty report content\.?/gi, '未生成有效报告正文。')
+      .replace(/returned no text\.?/gi, '未返回有效正文。')
+      .replace(/returned no response\.?/gi, '未返回有效响应。')
+      .replace(/couldn't generate a response\.?/gi, '未能生成有效响应。')
+      .replace(/returned invalid K\/HB format: standalone .* headings are not allowed\.?/gi, '生成结果不符合编报格式要求。')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (normalized.length <= maxLength) return normalized;
+    return `${normalized.slice(0, maxLength - 1)}…`;
+  }
+
   private sanitizeLogText(value: string, maxLength: number): string {
     const redacted = String(value)
       .replace(/\b(api[_-]?key|token|secret|password|authorization)\b\s*[:=]\s*["']?[^"'\s,;}]+/gi, '$1=[redacted]')
@@ -1272,7 +1409,7 @@ export class ReportsService {
               const parsed = JSON.parse(await this.remoteFs.readFile(filePath)) as Partial<JobRecord>;
               if (!parsed.jobId || this.jobs.has(parsed.jobId)) return;
 
-              this.jobs.set(parsed.jobId, {
+              const job = {
                 jobId: parsed.jobId,
                 skill: parsed.skill ?? 'risk-assessment-reports',
                 payload: parsed.payload ?? {},
@@ -1286,7 +1423,9 @@ export class ReportsService {
                 events: [],
                 eventLog: Array.isArray(parsed.eventLog) ? parsed.eventLog.filter((item) => item && typeof item === 'object') as EventLogEntry[] : [],
                 progressState: parsed.progressState,
-              } as JobRecord);
+              } as JobRecord;
+              this.jobs.set(parsed.jobId, job);
+              void this.reconcileInterruptedJob(job, 'startup_restore');
             } catch {
               // Ignore corrupted persisted job files.
             }
@@ -1295,6 +1434,41 @@ export class ReportsService {
     } catch {
       // Ignore startup restore failures; new jobs still work.
     }
+  }
+
+  private async reconcileInterruptedJob(job: JobRecord, reason: string): Promise<void> {
+    if (job.status !== 'queued' && job.status !== 'running') return;
+    if (this.streams.has(job.jobId)) return;
+    if (await this.recoverJobFromExistingReport(job, reason)) return;
+
+    const lastActivityMs = this.lastJobActivityMs(job);
+    if (Date.now() - lastActivityMs < 20 * 60 * 1000) return;
+
+    job.status = 'failed';
+    job.stage = 'failed';
+    job.errorMessage = this.interruptedJobFailureMessage(job);
+    job.updatedAt = new Date().toISOString();
+    this.pushEvent(job, { type: 'error', message: job.errorMessage });
+    await this.writeJobState(job);
+  }
+
+  private lastJobActivityMs(job: JobRecord): number {
+    const times = [
+      new Date(job.updatedAt || job.createdAt).getTime(),
+      ...(job.eventLog || []).map((item) => new Date(item.time).getTime()),
+    ].filter((value) => Number.isFinite(value));
+    return times.length ? Math.max(...times) : Date.now();
+  }
+
+  private interruptedJobFailureMessage(job: JobRecord): string {
+    const text = [
+      job.errorMessage,
+      ...(job.eventLog || []).slice(-30).map((item) => [item.summary, item.detail, item.command].filter(Boolean).join(' ')),
+    ].join(' ');
+    if (/content_filter|inappropriate content|provider rejected|safety policy|high risk/i.test(text)) {
+      return '本次主题触发模型安全策略，生成内容被拦截，未形成有效报告。已停止等待，请调整表述或切换备用模型后重试。';
+    }
+    return '任务执行过程中服务连接中断，未找到可恢复的最终报告文件。已停止等待，请重新生成。';
   }
 
   private async resolveOpenClawReportFile(markdown: string, startedAtMs: number, jobId?: string, waitMs = 0) {
@@ -2270,30 +2444,30 @@ export class ReportsService {
 
   private assertUsableGeneratedMarkdown(markdown: string): void {
     const text = String(markdown || '').trim();
-    if (!text) throw new Error('OpenClaw report-agent returned empty report content.');
+    if (!text) throw new Error('未生成有效报告正文。');
     if (/[{｛]\s*(?:jobId|报告名|filename|fileName|actual file name|实际文件名)\s*[}｝]/i.test(text)) {
-      throw new Error('OpenClaw report-agent returned placeholder output instead of a report file.');
+      throw new Error('生成结果仍是占位内容，未形成正式报告。');
     }
     if (/REPORT_FILE\s*:\s*.+\.json\b/i.test(text) || /\/final\/summary\.json/i.test(text)) {
-      throw new Error('OpenClaw report-agent returned a JSON summary path instead of a Markdown report.');
+      throw new Error('生成结果不是正式 Markdown 报告。');
     }
     if (/复制报告到|copy\s+report\s+to/i.test(text) && text.length < 2000) {
-      throw new Error('OpenClaw report-agent returned workflow instructions instead of a final report.');
+      throw new Error('生成结果仍是流程说明，未形成正式报告。');
     }
     if (/^no response from openclaw\.?$/i.test(text)) {
-      throw new Error('OpenClaw report-agent returned no response.');
+      throw new Error('未返回有效响应。');
     }
     if (/agent couldn't generate a response/i.test(text)) {
-      throw new Error("OpenClaw report-agent couldn't generate a response.");
+      throw new Error('未能生成有效响应。');
     }
     if (/quota exhausted|429\s+quota|500\s+internal|internal error/i.test(text) && text.length < 2000) {
       throw new Error(text.slice(0, 300));
     }
     if (text.length < 1000 && !/REPORT_FILE:\s*\/.+\.md/i.test(text)) {
-      throw new Error('OpenClaw report-agent returned too little report content.');
+      throw new Error('生成内容不足，未达到编报成稿要求。');
     }
     if (this.hasForbiddenWriteHbPrefaceHeadings(text)) {
-      throw new Error('OpenClaw report-agent returned invalid K/HB format: standalone 导语/摘要 headings are not allowed.');
+      throw new Error('生成结果不符合编报格式要求：不允许单独输出导语或摘要标题。');
     }
   }
 

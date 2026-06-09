@@ -45,7 +45,7 @@ export interface JobRecord {
 export interface EventLogEntry {
   id: string;
   time: string;
-  type: 'stage' | 'tool_start' | 'tool_end' | 'tool_error' | 'done' | 'error';
+  type: 'stage' | 'tool_start' | 'tool_delta' | 'tool_end' | 'tool_error' | 'done' | 'error';
   label: string;
   status: string;
   summary: string;
@@ -53,6 +53,10 @@ export interface EventLogEntry {
   phase?: string;
   actor?: string;
   detail?: string;
+  toolName?: string;
+  toolDisplayName?: string;
+  toolId?: string;
+  toolEngine?: string;
 }
 
 export type ServerEvent =
