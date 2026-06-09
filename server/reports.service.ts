@@ -373,11 +373,11 @@ export class ReportsService {
       });
     }
 
-    const stages = this.normalizeProgressStageOrder(PROGRESS_STAGE_DEFS.map((stage) => ({
+    const stages = this.ensureActiveProgressStage(this.normalizeProgressStageOrder(PROGRESS_STAGE_DEFS.map((stage) => ({
       ...stage,
       status: statusByStage.get(stage.key) || 'not_started',
       evidence: evidenceByStage.get(stage.key) || [],
-    })));
+    }))), job, now);
     const currentStage = this.currentProgressStage(stages);
     return {
       jobId: job.jobId,
@@ -400,9 +400,12 @@ export class ReportsService {
     if (/context_preparing|context\.json|preparing openclaw/.test(haystack)) return { key: 'prepare', status };
     if (/pg向量|pg-sources|pg_sources|vector_sources|database_sources|database_query_plan|数据库信源|信源检索/.test(haystack)) return { key: 'source', status };
     if (/research_planning|harness_cli\.py\s+plan|plan\.json|调研计划/.test(haystack)) return { key: 'plan', status };
+    if (/synthesis_dispatch|synthesis_waiting/.test(entry.phase || '')) {
+      return { key: 'consolidate', status: status === 'failed' ? 'failed' : 'running' };
+    }
     if (/research_dispatch|research_waiting|research_collecting|harness_cli\.py\s+run|research_|sessions_spawn|sessions_yield|资料|调研子任务/.test(haystack)) return { key: 'research', status };
     if (/research_consolidating|consolidated\.json|素材整合|证据包/.test(haystack)) return { key: 'consolidate', status };
-    if (/synthesis|report_saving|report_verifying|final\/report\.md|报告文件|撰写|校验报告/.test(haystack)) {
+    if (/report_saving|report_verifying|final\/report\.md|report_file|报告文件|校验报告/.test(haystack)) {
       return { key: 'report', status: status === 'failed' ? 'failed' : 'running' };
     }
     return null;
@@ -538,6 +541,29 @@ export class ReportsService {
           {
             source: 'artifact',
             message: `已观察到后续阶段“${stages[observableLimit].title}”的真实执行证据。`,
+            time: now,
+          },
+        ],
+      };
+    });
+  }
+
+  private ensureActiveProgressStage(stages: ReportProgressStage[], job: JobRecord, now: string): ReportProgressStage[] {
+    if (job.status !== 'queued' && job.status !== 'running') return stages;
+    if (stages.some((stage) => stage.status === 'failed' || stage.status === 'running')) return stages;
+
+    const lastDoneIndex = stages.reduce((last, stage, index) => stage.status === 'done' ? index : last, -1);
+    const activeIndex = Math.min(Math.max(lastDoneIndex + 1, 0), stages.length - 1);
+    return stages.map((stage, index) => {
+      if (index !== activeIndex || stage.status !== 'not_started') return stage;
+      return {
+        ...stage,
+        status: 'running',
+        evidence: [
+          ...stage.evidence,
+          {
+            source: 'job_status',
+            message: '任务仍在运行，等待该阶段的实时执行证据。',
             time: now,
           },
         ],
