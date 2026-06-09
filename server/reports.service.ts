@@ -1105,7 +1105,20 @@ export class ReportsService {
   }
 
   private formatToolDisplayName(toolName: string): string {
-    return this.sanitizeLogText(String(toolName || '').replace(/\s+/g, ' ').trim(), 120);
+    const raw = String(toolName || '').replace(/\s+/g, ' ').trim();
+    const lower = raw.toLowerCase();
+    if (
+      /pg-sources__query|pg_sources__query|mysql-test__mysql_query|mysql_test__mysql_query|database_sources|database_query_plan|vector_sources/.test(lower) ||
+      /\b(pg|postgres|postgresql|mysql|sql|vector|embedding|database|db)\b/.test(lower)
+    ) {
+      return '数据库检索工具';
+    }
+    if (
+      /\b(exa|firecrawl|tavily|internet|search|crawl|scrape|browser)\b|exa[_\s-]?search|firecrawl[_\s-]?(mcp|search|extract|crawl|scrape)|web[_\s-]?(search|serch|fetch|crawl|scrape)|search\.mjs|extract\.mjs/.test(lower)
+    ) {
+      return '互联网搜索工具';
+    }
+    return '本地脚本工具';
   }
 
   private firstString(data: Record<string, unknown> | null, keys: string[]): string {
@@ -1284,6 +1297,7 @@ export class ReportsService {
   private sanitizeCommandForEventLog(value: string): string {
     if (!value) return '';
     const sanitized = this.sanitizeLogText(value, 180)
+      .replace(/\b(?:exa|firecrawl|tavily|tavily[_\s-]?(?:search|extract)|exa[_\s-]?search|firecrawl[_\s-]?(?:mcp|search|extract|crawl|scrape)|web[_\s-]?(?:search|serch|fetch|crawl|scrape)|search\.mjs|extract\.mjs)\b/gi, '互联网搜索工具')
       .replace(/(?:\/home\/node\/\.openclaw\/workspace\/|\/usr\/docker\/openclaw\/workspace\/)/g, '.../')
       .replace(/([A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|KEY)[A-Z0-9_]*=)[^\s"'`]+/gi, '$1[redacted]');
     return sanitized;
@@ -1361,6 +1375,7 @@ export class ReportsService {
       return '本次主题触发模型安全策略，生成内容被拦截，未形成有效报告。请调整表述或降低敏感措辞后重试。';
     }
     const normalized = text
+      .replace(/\b(?:exa|firecrawl|tavily|tavily[_\s-]?(?:search|extract)|exa[_\s-]?search|firecrawl[_\s-]?(?:mcp|search|extract|crawl|scrape)|web[_\s-]?(?:search|serch|fetch|crawl|scrape)|search\.mjs|extract\.mjs)\b/gi, '互联网搜索工具')
       .replace(/OpenClaw\s+Gateway/gi, '任务通道')
       .replace(/OpenClaw\s+report-agent/gi, '编报智能体')
       .replace(/OpenClaw\s+qa-agent/gi, '问答智能体')
