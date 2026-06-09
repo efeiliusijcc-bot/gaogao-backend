@@ -964,6 +964,7 @@ export class OpenClawService {
       '9. Research Phase 禁止把 research_cli.py brief 作为 K/HB 主调研路径；research_cli.py brief 只允许在 harness_cli.py plan/run 已失败且已记录 firecrawl_fallback_reason 时作为异常补充。PG 向量信源不能替代 Tavily、Exa、Firecrawl 三件套，不能减少 harness_cli.py run、research_*.json 或 consolidated.json 的生成要求。',
       '10. Research Phase 输出必须形成完整内部素材包：context.json、plan.json、至少一个 groups/group_*.json、至少一个 research/research_*.json、research/consolidated.json、sources、evidence_cards、key_findings、verification_needed 和信息缺口；consolidated.json 或 research_*.json 中必须能看到 Tavily、Exa、Firecrawl 调研记录，除非三件套不可用且已记录明确 fallback reason。',
       '11. Write-HB Phase：只在 Research Phase 完成后，基于前置研究结果和用户 selectedModules，按 sectionTitle 对应的 K报/HB报一级章节逐章撰写；每章重点展开 selectedDirections，未选方向不得强行作为正文重点。',
+      '11a. K报篇幅是硬约束：最终 Markdown 目标约 9000-11000 个中文字符，按 A4 常规排版约 10 页；最低不得低于 8500 个中文字符。不得通过新增一级章节、堆砌参考资料或重复空话凑篇幅，只能通过增加事实密度、分析层次、风险链条、对策可操作性和信息缺口说明扩写。低于 8500 中文字符必须视为不合格并重新扩写，禁止交付短稿。',
       `12. 必须把完整成稿 Markdown 写入 ${OPENCLAW_CONTAINER_REPORT_DIR} 下的 .md 文件；不要只在对话中输出正文。`,
       `13. 静默执行：调研、检索、提取、规划、草稿、进度说明都不要发送到对话；不要输出“任务已启动”“正在检索”“获取了足够素材”等中间文本。`,
       `14. 最终对话只输出一行：REPORT_FILE: ${OPENCLAW_CONTAINER_REPORT_DIR}/实际文件名.md。这里的”实际文件名”必须替换为真实已写入的 .md 文件名；严禁输出 ${jobId}、{报告名}、{filename}、summary.json、plan.json、context.json 或复制/后处理说明。除这一行外不要输出摘要、正文、来源表或其他说明。`,
