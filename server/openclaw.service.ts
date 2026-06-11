@@ -273,7 +273,14 @@ export class OpenClawService {
     }
 
     const initialMarkdown = this.extractAgentMarkdown(agentPayload) || this.extractSessionFinalText(sessionKey);
-    const markdown = await this.waitForGatewayFinalText(sessionKey, initialMarkdown, startedAt, input.onEvent, flushSessionEvents);
+    const markdown = await this.waitForGatewayFinalText(
+      sessionKey,
+      initialMarkdown,
+      startedAt,
+      input.onEvent,
+      flushSessionEvents,
+      input.skill === 'write-hb',
+    );
     if (!markdown) {
       throw new Error(`OpenClaw report-agent returned no text. Raw payload: ${JSON.stringify(agentPayload).slice(0, 2000)}`);
     }
@@ -291,9 +298,10 @@ export class OpenClawService {
     startedAt: number,
     onEvent: (event: ServerEvent) => void,
     flushSessionEvents: () => void,
+    requireReportFilePointer = false,
   ): Promise<string> {
     const initial = initialMarkdown.trim();
-    if (this.isFinalReportText(initial)) return initial;
+    if (this.isFinalReportText(initial, requireReportFilePointer)) return initial;
 
     const deadline = startedAt + REPORT_TIMEOUT_MS;
     let announced = false;
@@ -310,19 +318,20 @@ export class OpenClawService {
       await this.sleep(GATEWAY_FINAL_POLL_INTERVAL_MS);
       flushSessionEvents();
       const sessionText = this.extractSessionFinalText(sessionKey).trim();
-      if (this.isFinalReportText(sessionText)) return sessionText;
+      if (this.isFinalReportText(sessionText, requireReportFilePointer)) return sessionText;
     }
 
-    return initial;
+    return requireReportFilePointer ? '' : initial;
   }
 
-  private isFinalReportText(text: string): boolean {
+  private isFinalReportText(text: string, requireReportFilePointer = false): boolean {
     const trimmed = text.trim();
     if (!trimmed) return false;
     if (/^HEARTBEAT_OK$/i.test(trimmed)) return false;
     if (/^\[?Context:/i.test(trimmed)) return false;
     if (/sessions_yield|等待.*Sub-Agent|等待.*完成/i.test(trimmed)) return false;
     if (/REPORT_FILE\s*:\s*\/.+\.md\s*$/im.test(trimmed)) return true;
+    if (requireReportFilePointer) return false;
     return trimmed.length >= 1000 && !/REPORT_FILE\s*:/i.test(trimmed);
   }
 

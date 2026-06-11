@@ -1525,16 +1525,10 @@ export class ReportsService {
   }
 
   private async resolveOpenClawReportFileOnce(markdown: string, startedAtMs: number, jobId?: string) {
+    if (!this.hasReportFilePointer(markdown)) return null;
+
     const fromText = await this.readMarkdownFile(this.extractReportPath(markdown));
     if (fromText) return fromText;
-
-    if (jobId) {
-      const fromJobDir = await this.findMarkdownFileInJobDir(jobId);
-      if (fromJobDir) return fromJobDir;
-    }
-
-    const latest = await this.findLatestMarkdownFile(startedAtMs);
-    if (latest) return latest;
 
     return null;
   }
@@ -1548,6 +1542,10 @@ export class ReportsService {
     const pattern = /(?:\/home\/node\/\.openclaw\/workspace\/report-agent\/reports\/|\/usr\/docker\/openclaw\/workspace\/report-agent\/reports\/)[^\r\n`"'<>|?*]+?\.md/gi;
     const matches = Array.from(normalized.matchAll(pattern)).map((match) => match[0].trim());
     return matches.find((candidate) => this.remoteFs.isInsideReportDir(candidate)) ?? null;
+  }
+
+  private hasReportFilePointer(text: string): boolean {
+    return /^\s*REPORT_FILE\s*:\s*\/.+\.md\s*$/im.test(String(text || ''));
   }
 
   private async findLatestMarkdownFile(startedAtMs: number) {
@@ -1611,6 +1609,7 @@ export class ReportsService {
 
   private async recoverJobFromExistingReport(job: JobRecord, reason: string): Promise<boolean> {
     if (job.status === 'succeeded' && job.resultPath && job.markdown) return false;
+    if (!this.canRecoverJobFromExistingReport(job)) return false;
 
     const report = await this.findMarkdownFileInJobDir(job.jobId) ?? await this.findBestMarkdownFileForJob(job);
     if (!report) return false;
@@ -1631,6 +1630,21 @@ export class ReportsService {
     this.pushEvent(job, { type: 'stage', stage: 'done', message: 'Report generation completed and saved to disk.' });
     await this.writeJobState(job);
     return true;
+  }
+
+  private canRecoverJobFromExistingReport(job: JobRecord): boolean {
+    if (job.status === 'queued' || job.status === 'running' || job.status === 'waiting_approval') return false;
+    return this.hasExplicitReportCompletionEvidence(job);
+  }
+
+  private hasExplicitReportCompletionEvidence(job: JobRecord): boolean {
+    return (job.eventLog || []).some((entry) => {
+      const text = [entry.phase, entry.status, entry.summary, entry.detail, entry.command].filter(Boolean).join(' ');
+      if (this.hasReportFilePointer(text)) return true;
+      return entry.type === 'stage'
+        && entry.phase === 'done'
+        && /report generation completed|报告.*完成|最终报告.*确认/i.test(entry.summary || '');
+    });
   }
 
   private async findBestMarkdownFileForJob(job: JobRecord) {
