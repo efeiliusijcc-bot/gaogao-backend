@@ -37,6 +37,7 @@ export interface JobRecord {
   artifacts: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
+  completedAt?: string;
   events: ServerEvent[];
   eventLog: EventLogEntry[];
   progressState?: ReportProgressState;

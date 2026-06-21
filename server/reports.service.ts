@@ -179,7 +179,7 @@ export class ReportsService {
     const filtered = Array.from(this.jobs.values())
       .filter((job) => type === 'all' || this.jobTypeKey(job) === type)
       .filter((job) => !query || this.jobSearchText(job).includes(query))
-      .sort((a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime());
+      .sort((a, b) => this.reportHistoryTimeMs(b) - this.reportHistoryTimeMs(a));
 
     const total = filtered.length;
     const totalPages = Math.max(1, Math.ceil(total / pageSize));
@@ -240,7 +240,16 @@ export class ReportsService {
       progressState: this.sanitizeProgressState(job.progressState),
       createdAt: job.createdAt,
       updatedAt: job.updatedAt,
+      completedAt: job.completedAt,
     };
+  }
+
+  private reportHistoryTimeMs(job: JobRecord): number {
+    const value = job.status === 'succeeded'
+      ? job.completedAt || job.createdAt
+      : job.updatedAt || job.createdAt;
+    const parsed = new Date(value).getTime();
+    return Number.isFinite(parsed) ? parsed : 0;
   }
 
   private parsePositiveInt(value: string | number | undefined, fallback: number): number {
@@ -621,7 +630,7 @@ export class ReportsService {
     if (fallback?.filePath && fallback.filePath !== job.resultPath) {
       job.resultPath = fallback.filePath;
       job.markdown = fallback.markdown;
-      job.updatedAt = new Date().toISOString();
+      job.completedAt = job.completedAt || job.createdAt;
       await this.writeJobState(job);
     }
 
@@ -916,7 +925,8 @@ export class ReportsService {
       job.artifacts = { ...job.artifacts, ...result.artifacts };
       job.resultPath = resolvedReport?.filePath ?? (await this.writeReportFile(job, job.markdown));
       await this.writeReportReferencesArtifact(job, usableMarkdown);
-      job.updatedAt = new Date().toISOString();
+      job.completedAt = new Date().toISOString();
+      job.updatedAt = job.completedAt;
       await this.writeJobState(job);
       this.pushEvent(job, { type: 'stage', stage: 'done', message: 'Report generation completed and saved to disk.' });
       this.pushEvent(job, { type: 'done', jobId: job.jobId });
@@ -1458,6 +1468,7 @@ export class ReportsService {
                 artifacts: parsed.artifacts ?? {},
                 createdAt: parsed.createdAt ?? new Date().toISOString(),
                 updatedAt: parsed.updatedAt ?? parsed.createdAt ?? new Date().toISOString(),
+                completedAt: parsed.completedAt,
                 stage: parsed.stage,
                 resultPath: parsed.resultPath,
                 errorMessage: parsed.errorMessage,
@@ -1614,13 +1625,17 @@ export class ReportsService {
     const report = await this.findMarkdownFileInJobDir(job.jobId) ?? await this.findBestMarkdownFileForJob(job);
     if (!report) return false;
 
+    const previousUpdatedAt = job.updatedAt;
+    const preserveHistoryTime = reason === 'detail_lookup' || reason === 'result_lookup' || reason === 'download_lookup';
     job.status = 'succeeded';
     job.stage = 'done';
     job.markdown = report.markdown;
     job.resultPath = report.filePath;
     job.errorMessage = undefined;
     await this.writeReportReferencesArtifact(job, report.markdown);
-    job.updatedAt = new Date().toISOString();
+    const recoveredAt = new Date().toISOString();
+    job.completedAt = job.completedAt || (preserveHistoryTime ? job.createdAt : recoveredAt);
+    job.updatedAt = preserveHistoryTime ? previousUpdatedAt : recoveredAt;
 
     this.pushEvent(job, {
       type: 'stage',
