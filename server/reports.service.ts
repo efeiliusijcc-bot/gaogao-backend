@@ -3,8 +3,9 @@ import { marked } from 'marked';
 import { Subject } from 'rxjs';
 import { v4 as uuid } from 'uuid';
 import { OpenClawApprovalRequiredError, OpenClawService } from './openclaw.service.js';
-import { RemoteFileService } from './remote-file.service.js';
+import { RemoteFileService, type RemoteDirent } from './remote-file.service.js';
 import { VectorSourceService, type VectorSearchResult, type VectorSourceItem } from './vector-source.service.js';
+import { derivePublishTime, deriveSourceName, parseReportReferenceEntry } from './report-reference-parser.js';
 import type { CreateJobRequest } from '../src/types/report.js';
 import type {
   EventLogEntry,
@@ -75,6 +76,17 @@ type ReportSourceListType = 'all' | 'database_recall' | 'tool_search' | 'report_
 type ReportSourceOrigin = 'database_recall' | 'tool_search';
 type ReportEvidenceKind = 'report_reference' | 'structured_source' | 'research_source' | 'evidence_card';
 type ReportSourceEngine = 'exa' | 'firecrawl' | 'tavily' | 'tavily_extract' | 'pg_vector' | 'database';
+
+const DEFAULT_REPORT_HISTORY_VISIBLE_AFTER = '2026-07-10T23:59:59.999+08:00';
+const REPORT_HISTORY_VISIBLE_AFTER_MS = parseReportHistoryVisibleAfterMs();
+
+function parseReportHistoryVisibleAfterMs(): number {
+  const rawValue = process.env.REPORT_HISTORY_VISIBLE_AFTER ?? DEFAULT_REPORT_HISTORY_VISIBLE_AFTER;
+  const value = rawValue.trim();
+  if (!value) return 0;
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
 
 const PROGRESS_STAGE_DEFS: Array<Omit<ReportProgressStage, 'status' | 'evidence'>> = [
   { key: 'prepare', title: '任务准备', desc: '整理编报要求并建立任务空间' },
@@ -177,6 +189,7 @@ export class ReportsService {
     const query = String(options.q ?? '').trim().toLowerCase();
 
     const filtered = Array.from(this.jobs.values())
+      .filter((job) => this.isVisibleInReportHistory(job))
       .filter((job) => type === 'all' || this.jobTypeKey(job) === type)
       .filter((job) => !query || this.jobSearchText(job).includes(query))
       .sort((a, b) => this.reportHistoryTimeMs(b) - this.reportHistoryTimeMs(a));
@@ -250,6 +263,12 @@ export class ReportsService {
       : job.updatedAt || job.createdAt;
     const parsed = new Date(value).getTime();
     return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  private isVisibleInReportHistory(job: JobRecord): boolean {
+    if (!REPORT_HISTORY_VISIBLE_AFTER_MS) return true;
+    if (job.status !== 'succeeded') return true;
+    return this.reportHistoryTimeMs(job) > REPORT_HISTORY_VISIBLE_AFTER_MS;
   }
 
   private parsePositiveInt(value: string | number | undefined, fallback: number): number {
@@ -1898,7 +1917,7 @@ export class ReportsService {
 
     return allNumbers.map((number, index) => {
       const reference = references.get(number);
-      const fallback = structured[number - 1];
+      const fallback = this.findMatchingStructuredSource(reference, structured);
       const rawReferenceText = reference?.rawReferenceText || reference?.summary || reference?.title || '';
       const matched = Boolean(fallback?.title || fallback?.url || fallback?.summary);
       return {
@@ -2036,6 +2055,21 @@ export class ReportsService {
     }
   }
 
+  private findMatchingStructuredSource(
+    reference: Partial<ReportSourceListItem> | undefined,
+    structured: ReportSourceListItem[],
+  ): ReportSourceListItem | undefined {
+    if (!reference) return undefined;
+    const normalizedUrl = this.normalizeSourceUrl(reference.url);
+    if (normalizedUrl) {
+      const byUrl = structured.find((item) => this.normalizeSourceUrl(item.url) === normalizedUrl);
+      if (byUrl) return byUrl;
+    }
+    const title = String(reference.title || '').trim();
+    if (!title || title === '--') return undefined;
+    return structured.find((item) => String(item.title || '').trim() === title);
+  }
+
   private parseReferenceEntriesRobust(markdown: string): Map<number, Partial<ReportSourceListItem>> {
     const refs = new Map<number, Partial<ReportSourceListItem>>();
     const refsStart = this.findReferenceSectionStart(markdown);
@@ -2047,12 +2081,13 @@ export class ReportsService {
       const number = Number(match[1] || match[2]);
       const entry = String(match[3] || '').replace(/\s+/g, ' ').trim();
       if (!number || !entry) continue;
-      const url = entry.match(/https?:\/\/\S+/)?.[0]?.replace(/[),.;\uff0c\u3002\uff1b\uff09]+$/g, '') || '';
-      const title = url ? entry.replace(url, '').trim() : entry;
+      const parsed = parseReportReferenceEntry(number, entry);
       refs.set(number, {
-        title: this.sanitizeLogText(title || entry, 220),
-        url: this.sanitizeLogText(url, 500),
-        summary: this.sanitizeLogText(entry, 800),
+        title: this.sanitizeLogText(parsed?.title || entry, 220),
+        url: this.sanitizeLogText(parsed?.url || '', 500),
+        sourceName: this.sanitizeLogText(parsed?.sourceName || '', 140),
+        publishTime: this.sanitizeLogText(parsed?.publishTime || '', 80),
+        summary: this.sanitizeLogText(parsed?.summary || entry, 800),
         rawReferenceText: this.sanitizeLogText(entry, 1200),
       });
     }
@@ -2123,27 +2158,24 @@ export class ReportsService {
   }
 
   private async toolSearchSources(job: JobRecord): Promise<ReportSourceListItem[]> {
-    const dir = this.remoteFs.joinPath(this.remoteFs.remoteDir, job.jobId);
-    if (!(await this.remoteFs.exists(dir))) return [];
+    const dir = await this.resolveOpenClawJobDir(job) || this.remoteFs.joinPath(this.remoteFs.remoteDir, job.jobId);
     const researchDir = this.remoteFs.joinPath(dir, 'research');
-    if (!(await this.remoteFs.exists(researchDir))) return [];
 
     const rawItems: Array<{ item: unknown; evidenceKind: ReportEvidenceKind }> = [];
-    for (const filename of ['consolidated.json']) {
-      const parsed = await this.readJsonFile(this.remoteFs.joinPath(researchDir, filename));
-      rawItems.push(...this.extractToolSearchRawItems(parsed));
-    }
-
+    let entries: RemoteDirent[];
     try {
-      const entries = await this.remoteFs.readdir(researchDir);
-      for (const entry of entries) {
-        if (!entry.isFile || !/^research_[a-z0-9_-]+\.json$/i.test(entry.name)) continue;
-        const parsed = await this.readJsonFile(this.remoteFs.joinPath(researchDir, entry.name));
-        rawItems.push(...this.extractToolSearchRawItems(parsed));
-        if (rawItems.length >= 300) break;
-      }
+      entries = await this.remoteFs.readdir(researchDir);
     } catch {
       // Missing research directory is a valid state for older or failed jobs.
+      return [];
+    }
+    const consolidated = await this.readJsonFile(this.remoteFs.joinPath(researchDir, 'consolidated.json'));
+    rawItems.push(...this.extractToolSearchRawItems(consolidated));
+    for (const entry of entries) {
+      if (!entry.isFile || !/^research_[a-z0-9_-]+\.json$/i.test(entry.name)) continue;
+      const parsed = await this.readJsonFile(this.remoteFs.joinPath(researchDir, entry.name));
+      rawItems.push(...this.extractToolSearchRawItems(parsed));
+      if (rawItems.length >= 300) break;
     }
 
     const normalized = rawItems
@@ -2302,8 +2334,10 @@ export class ReportsService {
   private normalizeSourceRecord(source: Record<string, unknown>, index: number, sourceGroup: Exclude<ReportSourceListType, 'all'>): ReportSourceListItem {
     const title = this.firstString(source, ['title', 'ch_title', 'headline', 'sourceTitle', 'name']);
     const url = this.firstString(source, ['url', 'source_url', 'data_source_url', 'sourceUrl']);
-    const sourceName = this.firstString(source, ['publisher', 'website_name', 'source_name', 'site_name', 'sourceName', 'websiteName']);
-    const publishTime = this.firstString(source, ['published_at', 'publish_time', 'pub_time', 'source_time', 'publishTime', 'publishedAt', 'time']);
+    const sourceName = this.firstString(source, ['publisher', 'website_name', 'source_name', 'site_name', 'sourceName', 'websiteName'])
+      || deriveSourceName(title, url);
+    const publishTime = this.firstString(source, ['published_at', 'publish_time', 'pub_time', 'source_time', 'publishTime', 'publishedAt', 'time'])
+      || derivePublishTime(title, url);
     const summary = this.firstString(source, ['summary', 'abstract', 'description', 'snippet', 'finding', 'claim', 'content_preview']);
     const excerpt = this.firstString(source, ['excerpt', 'content_excerpt', 'chunk_text', 'content_chunk', 'body', 'content', 'markdown', 'content_preview']);
     const sourceType = this.firstString(source, ['source_type', 'type', 'tag', 'designated_tag', 'sourceType']);
