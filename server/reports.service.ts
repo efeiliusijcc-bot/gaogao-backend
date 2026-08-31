@@ -1822,6 +1822,7 @@ export class ReportsService {
     const researchKeys = new Set(researchItems.map((item) => this.sourceDedupeKey(item)).filter(Boolean));
     const publicRefs = reportRefs
       .filter((ref) => {
+        if (!this.normalizeSourceUrl(ref.url)) return false;
         const key = this.sourceDedupeKey(ref);
         return !key || !databaseKeys.has(key) || researchKeys.has(key);
       })
