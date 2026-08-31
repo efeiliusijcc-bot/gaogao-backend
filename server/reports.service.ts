@@ -2337,10 +2337,15 @@ export class ReportsService {
     const url = this.firstString(source, ['url', 'source_url', 'data_source_url', 'sourceUrl']);
     const sourceName = this.firstString(source, ['publisher', 'website_name', 'source_name', 'site_name', 'sourceName', 'websiteName'])
       || deriveSourceName(title, url);
-    const publishTime = this.firstString(source, ['published_at', 'publish_time', 'pub_time', 'source_time', 'publishTime', 'publishedAt', 'time'])
-      || derivePublishTime(title, url);
     const summary = this.firstString(source, ['summary', 'abstract', 'description', 'snippet', 'finding', 'claim', 'content_preview']);
     const excerpt = this.firstString(source, ['excerpt', 'content_excerpt', 'chunk_text', 'content_chunk', 'body', 'content', 'markdown', 'content_preview']);
+    const publicationMetadata = [
+      this.firstString(source, ['content_preview', 'finding']),
+      summary,
+      excerpt,
+    ].filter(Boolean).join('\n');
+    const publishTime = this.firstString(source, ['published_at', 'publish_time', 'pub_time', 'source_time', 'publishTime', 'publishedAt', 'time'])
+      || derivePublishTime(title, url, publicationMetadata);
     const sourceType = this.firstString(source, ['source_type', 'type', 'tag', 'designated_tag', 'sourceType']);
     const score = this.firstNumber(source, ['relevance_score', 'relevanceScore', 'score', 'similarity', 'rank_score', 'credibility_score']);
     const id = this.firstString(source, ['id', 'sourceId', 'source_id', 'mysql_id']) || `${sourceGroup}-${url || title || index}`;

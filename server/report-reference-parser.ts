@@ -36,21 +36,57 @@ export function deriveSourceName(title: string, url: string): string {
   }
 }
 
-export function derivePublishTime(title: string, url: string): string {
-  const text = `${title} ${url}`;
+function normalizeDate(year: string, month: string, day: string): string {
+  const yearNumber = Number(year);
+  const monthNumber = Number(month);
+  const dayNumber = Number(day);
+  const value = new Date(Date.UTC(yearNumber, monthNumber - 1, dayNumber));
+  if (
+    value.getUTCFullYear() !== yearNumber
+    || value.getUTCMonth() + 1 !== monthNumber
+    || value.getUTCDate() !== dayNumber
+  ) return '';
+  return `${year}-${String(monthNumber).padStart(2, '0')}-${String(dayNumber).padStart(2, '0')}`;
+}
+
+function extractDerivedDate(value: string): string {
+  const text = value;
   const separated = text.match(/(?:^|\D)((?:19|20)\d{2})[-\/]([01]?\d)[-\/]([0-3]?\d)(?:\D|$)/);
   if (separated) {
-    return `${separated[1]}-${String(separated[2]).padStart(2, '0')}-${String(separated[3]).padStart(2, '0')}`;
+    return normalizeDate(separated[1], separated[2], separated[3]);
   }
   const chinese = text.match(/((?:19|20)\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?/);
   if (chinese) {
-    return `${chinese[1]}-${String(chinese[2]).padStart(2, '0')}-${String(chinese[3]).padStart(2, '0')}`;
+    return normalizeDate(chinese[1], chinese[2], chinese[3]);
   }
   const compact = text.match(/(?:^|\D)((?:19|20)\d{2})([01]\d)([0-3]\d)(?:\D|$)/);
   if (compact) {
-    return `${compact[1]}-${compact[2]}-${compact[3]}`;
+    return normalizeDate(compact[1], compact[2], compact[3]);
   }
   return '';
+}
+
+function derivePublishTimeFromMetadata(metadata: string): string {
+  if (!metadata) return '';
+  const firstLines = metadata
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, 6);
+  for (const line of firstLines) {
+    if (/^(?:19|20)\d{2}[-\/]\d{1,2}[-\/]\d{1,2}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?$/.test(line)) {
+      return extractDerivedDate(line);
+    }
+  }
+
+  const metadataBlock = metadata.slice(0, 800).match(
+    /(?:来源|类型|分类|发布时间|发布日期|更新时间)[：:\s\S]{0,160}?((?:19|20)\d{2}[-\/]\d{1,2}[-\/]\d{1,2})(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?/,
+  );
+  return metadataBlock ? extractDerivedDate(metadataBlock[1]) : '';
+}
+
+export function derivePublishTime(title: string, url: string, metadata = ''): string {
+  return extractDerivedDate(`${title} ${url}`) || derivePublishTimeFromMetadata(metadata);
 }
 
 function splitTopLevelComma(value: string): [string, string] {

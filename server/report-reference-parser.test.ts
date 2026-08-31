@@ -36,3 +36,34 @@ test('falls back to hostname and supports dates in a Chinese title', () => {
   assert.equal(deriveSourceName('一条没有机构后缀的公开报道', 'https://example.org/article/42'), 'example.org');
   assert.equal(derivePublishTime('2026年5月15日外交部发言人主持记者会', ''), '2026-05-15');
 });
+
+test('derives a publication date from a standalone date near the page heading', () => {
+  const metadata = [
+    '## 赵明昊：中美元首立春通话，“春天有约”',
+    '',
+    '2026-02-07',
+    '',
+    '2月4日晚，两国元首通电话。',
+  ].join('\n');
+  assert.equal(derivePublishTime('赵明昊：中美元首立春通话，“春天有约”', 'https://example.org/article', metadata), '2026-02-07');
+});
+
+test('derives a publication date from an explicit source metadata block', () => {
+  const metadata = [
+    '搜索搜索',
+    '首页 > 新闻发布',
+    '来源：新华社',
+    '类型：转载 分类：新闻 2026-05-14 14:08',
+    '习近平同美国总统特朗普会谈',
+  ].join('\n');
+  assert.equal(derivePublishTime('习近平同美国总统特朗普会谈', 'https://example.org/article', metadata), '2026-05-14');
+});
+
+test('does not treat a date mentioned in article content as publication metadata', () => {
+  const metadata = [
+    '## 会谈背景与影响',
+    '',
+    '文章回顾了2026年5月7日的例行记者会，并分析后续影响。',
+  ].join('\n');
+  assert.equal(derivePublishTime('会谈背景与影响', 'https://example.org/article', metadata), '');
+});
